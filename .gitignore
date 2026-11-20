@@ -35,3 +35,7 @@ reg_b.json
 reg_b_resp.json
 run_a.json
 runs_a.json
+
+# Restore-test clones (created during checkpoint verification)
+nexora-restore-test/
+*-restore-test/
