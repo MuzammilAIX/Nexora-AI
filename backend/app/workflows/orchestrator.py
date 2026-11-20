@@ -1,4 +1,4 @@
-﻿from typing import Any, Literal
+from typing import Any, Literal
 from typing_extensions import TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,6 +11,7 @@ from ..agents.base import AgentInput
 from ..agents.research import ResearchAgent
 from ..agents.lead import LeadAgent
 from ..agents.email import EmailAgent
+from ..agents.support import SupportAgent
 from ..agents.reporting import ReportingAgent
 from ..agents.review import ReviewAgent
 from ..services.event_bus import bus
@@ -27,6 +28,20 @@ CRM_PATTERNS = _re.compile(
 def _force_lead_agent(user_request: str) -> bool:
     """Deterministic CRM-intent detector. True = force a 'lead' task."""
     return bool(CRM_PATTERNS.search(user_request or ""))
+
+SUPPORT_PATTERNS = _re.compile(
+    r"\\b(support\s+(email|ticket|request)|customer\s+(email|complaint|question)|"
+    r"reply\s+to\s+(that\s+|the\s+)?(support\s+)?(email|ticket)|"
+    r"respond\s+to\s+(the\s+)?(customer|support)|"
+    r"draft\s+(a\s+)?(response|reply)\s+(to\s+)?(the\s+)?(customer|support))\\b",
+    _re.IGNORECASE,
+)
+
+
+def _force_support_agent(user_request: str) -> bool:
+    """Deterministic support-intent detector. True = force a 'support' task."""
+    return bool(SUPPORT_PATTERNS.search(user_request or ""))
+
 from ..database import SessionFactory
 from ..database.approval_models import Approval
 from ..audit import audit
@@ -130,6 +145,7 @@ _AGENTS = {
     "email": EmailAgent(),
     "reporting": ReportingAgent(),
     "review": ReviewAgent(),
+    "support": SupportAgent(),
 }
 
 
@@ -183,7 +199,7 @@ def create_plan(state: OrchestratorState) -> dict:
                     "You may ONLY use these agent_type values: "
                     "'research' (find companies, people, facts), "
                     "'email' (draft email content), "
-                    "'reporting' (produce structured business reports), "
+                    "'reporting' (produce structured business reports), 'support' (handle customer support emails: classify issue, look up customer, draft response), "
                     "'review' (critique outputs of prior tasks for accuracy, "
                     "missing info, and quality). "
                     "If a task needs anything else, omit it or fold it into "
@@ -207,6 +223,15 @@ def create_plan(state: OrchestratorState) -> dict:
             tasks[0]["requires_approval"] = True
             tasks[0]["approval_reason"] = (
                 "Lead tasks read+write CRM data; human approval is required."
+            )
+
+        # Deterministic override: if the request is clearly support-related,
+        # rewrite the FIRST task to use the support agent.
+        if _force_support_agent(state.get("user_request", "")) and tasks:
+            tasks[0]["agent_type"] = "support"
+            tasks[0]["requires_approval"] = True
+            tasks[0]["approval_reason"] = (
+                "Sending external emails requires human approval."
             )
 
         return {
