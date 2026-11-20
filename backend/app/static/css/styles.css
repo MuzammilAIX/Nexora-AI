@@ -639,3 +639,118 @@ input:focus, textarea:focus {
   color: var(--text-muted);
   word-break: break-word;
 }
+
+/* --- Overview dashboard (Slice 1.10) --- */
+.overview-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.overview-fetched {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.overview-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+@media (max-width: 900px) {
+  .overview-kpis { grid-template-columns: repeat(2, 1fr); }
+}
+
+.overview-kpi {
+  display: block;
+  padding: 16px 18px;
+  background: var(--panel-bg, #1a1d23);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.overview-kpi:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.overview-kpi-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--accent);
+  line-height: 1.2;
+  margin-bottom: 4px;
+}
+
+.overview-kpi-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+
+.overview-kpi-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+
+@media (max-width: 900px) {
+  .overview-grid { grid-template-columns: 1fr; }
+}
+
+.overview-panel-wide {
+  grid-column: 1 / -1;
+}
+
+.overview-recent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.overview-recent-row {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.overview-recent-row:last-child { border-bottom: none; }
+
+.overview-recent-title {
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overview-recent-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.overview-recent-meta .status-connected { color: #4ade80; }
+.overview-recent-meta .status-error     { color: #f87171; }
+.overview-recent-meta .status-pending   { color: #facc15; }
+
+.panel-header a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 12px;
+}
+
+.panel-header a:hover {
+  text-decoration: underline;
+}
