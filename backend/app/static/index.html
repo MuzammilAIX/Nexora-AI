@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nexora AI · Command Center</title>
+  <link rel="stylesheet" href="/app/css/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand">Nexora AI</div>
+      <div class="user-info" id="header-user"></div>
+    </header>
+
+    <aside class="app-sidebar">
+      <div class="brand-block">
+        <h1>Nexora</h1>
+        <div class="tag">Command Center</div>
+      </div>
+      <ul class="app-nav" id="app-nav"></ul>
+    </aside>
+
+    <main class="app-main" id="app-main"></main>
+  </div>
+
+  <script src="/app/js/auth.js"></script>
+  <script src="/app/js/api.js"></script>
+  <script src="/app/js/layout.js"></script>
+  <script src="/app/js/approvals.js"></script>
+  <script src="/app/js/integrations.js"></script>
+  <script src="/app/js/activity.js"></script>
+  <script>
+    requireAuth();
+    initLayout();
+  </script>
+</body>
+</html>
