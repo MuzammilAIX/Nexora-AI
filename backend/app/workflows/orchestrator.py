@@ -1,0 +1,528 @@
+﻿from typing import Any, Literal
+from typing_extensions import TypedDict
+
+from pydantic import BaseModel, ConfigDict, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import END, StateGraph
+
+from ..config import settings
+from ..agents.base import AgentInput
+from ..agents.research import ResearchAgent
+from ..agents.lead import LeadAgent
+from ..agents.email import EmailAgent
+from ..agents.reporting import ReportingAgent
+from ..agents.review import ReviewAgent
+from ..services.event_bus import bus
+
+import re as _re
+
+
+CRM_PATTERNS = _re.compile(
+    r"\b(crm|hubspot|pipeline|existing\s+(contacts?|leads?)|follow[\s-]?up\s+(with\s+)?leads?)\b",
+    _re.IGNORECASE,
+)
+
+
+def _force_lead_agent(user_request: str) -> bool:
+    """Deterministic CRM-intent detector. True = force a 'lead' task."""
+    return bool(CRM_PATTERNS.search(user_request or ""))
+from ..database import SessionFactory
+from ..database.approval_models import Approval
+from ..audit import audit
+
+
+# --------------------------------------------------
+# 1. Structured Output Models
+# --------------------------------------------------
+
+class RequestAnalysis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: str = Field(description="The main intent of the user's request")
+    goal: str = Field(description="The desired final outcome")
+    requirements: list[str] = Field(
+        description="Specific requirements identified in the request"
+    )
+    constraints: list[str] = Field(
+        description="Limitations, conditions, and constraints"
+    )
+
+
+class PlannedTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(description="Unique task identifier")
+    description: str = Field(description="What this task needs to accomplish")
+    agent_type: str = Field(
+        description="Type of specialist agent needed, such as research or writing"
+    )
+    dependencies: list[str] = Field(
+        description="IDs of tasks that must finish first"
+    )
+    requires_approval: bool = Field(
+        description="Whether human approval is needed before this task"
+    )
+    approval_reason: str | None = Field(
+        default=None,
+        description="Why approval is required, if applicable"
+    )
+
+
+class TaskPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tasks: list[PlannedTask] = Field(
+        description="Ordered list of tasks required to fulfill the request"
+    )
+    execution_notes: list[str] = Field(
+        description="Important notes about executing the plan safely"
+    )
+
+
+# --------------------------------------------------
+# 2. Shared Orchestrator State
+# --------------------------------------------------
+
+class OrchestratorState(TypedDict, total=False):
+    user_request: str
+    run_id: str
+    tenant_id: str
+    analysis: dict[str, Any]
+    tasks: list[dict[str, Any]]
+    execution_notes: list[str]
+    task_results: list[dict[str, Any]]
+    status: Literal[
+        "received",
+        "analyzing",
+        "planning",
+        "planned",
+        "executing",
+        "completed",
+        "failed",
+    ]
+    error: str
+
+
+# --------------------------------------------------
+# 3. LLM Configuration
+# --------------------------------------------------
+
+def get_llm() -> ChatOpenAI:
+    if not settings.OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY is not configured.")
+
+    return ChatOpenAI(
+        model=settings.OPENAI_MODEL,
+        api_key=settings.OPENAI_API_KEY,
+        timeout=60,
+        max_retries=2,
+    )
+
+
+# --------------------------------------------------
+# 4. Agent Registry
+# --------------------------------------------------
+
+_AGENTS = {
+    "research": ResearchAgent(),
+    "lead": LeadAgent(),
+    "email": EmailAgent(),
+    "reporting": ReportingAgent(),
+    "review": ReviewAgent(),
+}
+
+
+# --------------------------------------------------
+# 5. Request Analysis Node
+# --------------------------------------------------
+
+def analyze_request(state: OrchestratorState) -> dict:
+    try:
+        llm = get_llm().with_structured_output(RequestAnalysis)
+
+        result = llm.invoke([
+            SystemMessage(
+                content=(
+                    "You are Nexora AI's request analyzer. "
+                    "Understand the user's business objective. "
+                    "Identify intent, desired outcome, requirements, "
+                    "and constraints. Do not execute any actions."
+                )
+            ),
+            HumanMessage(content=state["user_request"]),
+        ])
+
+        return {
+            "analysis": result.model_dump(),
+            "status": "planning",
+            "error": "",
+        }
+
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": f"Request analysis failed: {exc}",
+        }
+
+
+# --------------------------------------------------
+# 6. Task Planning Node
+# --------------------------------------------------
+
+def create_plan(state: OrchestratorState) -> dict:
+    try:
+        llm = get_llm().with_structured_output(TaskPlan)
+
+        result = llm.invoke([
+            SystemMessage(
+                content=(
+                    "You are Nexora AI's task planner. "
+                    "Convert the supplied request analysis into "
+                    "an ordered, practical task plan. "
+                    "You may ONLY use these agent_type values: "
+                    "'research' (find companies, people, facts), "
+                    "'email' (draft email content), "
+                    "'reporting' (produce structured business reports), "
+                    "'review' (critique outputs of prior tasks for accuracy, "
+                    "missing info, and quality). "
+                    "If a task needs anything else, omit it or fold it into "
+                    "one of the two above. NEVER invent agent_type values. "
+                    "Set requires_approval=true for any task that sends "
+                    "emails or contacts external parties."
+                    "Do not claim that any task has been executed."
+                )
+            ),
+            HumanMessage(content=str(state["analysis"])),
+        ])
+
+        tasks = [task.model_dump() for task in result.tasks]
+
+        # Deterministic override: if the user request is clearly CRM-related,
+        # rewrite the FIRST task to use the lead agent and gate it for approval.
+        # Rationale: the LLM planner keeps decomposing CRM work into
+        # research+reporting+email tasks instead of a single lead task.
+        if _force_lead_agent(state.get("user_request", "")) and tasks:
+            tasks[0]["agent_type"] = "lead"
+            tasks[0]["requires_approval"] = True
+            tasks[0]["approval_reason"] = (
+                "Lead tasks read+write CRM data; human approval is required."
+            )
+
+        return {
+            "tasks": tasks,
+            "execution_notes": result.execution_notes,
+            "status": "executing",
+            "error": "",
+        }
+
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": f"Task planning failed: {exc}",
+        }
+
+
+# --------------------------------------------------
+# 7. Task Execution Node (async — calls real agents)
+# --------------------------------------------------
+
+async def execute_tasks(state: OrchestratorState) -> dict:
+    tasks = state.get("tasks", [])
+    results: list[dict[str, Any]] = []
+    completed: set[str] = set()
+    task_outputs: dict[str, Any] = {}
+    run_id = state.get("run_id", "")
+    # --- emit: start execution ---
+    if run_id:
+        bus.emit(run_id, "execution_start", task_count=len(tasks))
+    any_failed = False
+
+    for task in tasks:
+        task_id = task.get("task_id", "unknown")
+        agent_type = task.get("agent_type", "")
+        # --- emit: task_start ---
+        if run_id:
+            bus.emit(run_id, "task_start", task_id=task_id, agent_type=agent_type)
+
+        unmet = [
+            dep for dep in task.get("dependencies", [])
+            if dep not in completed
+        ]
+        if unmet:
+            results.append({
+                "task_id": task_id,
+                "agent_type": agent_type,
+                "status": "skipped",
+                "reason": f"unmet dependencies: {unmet}",
+            })
+            # Skipped due to unmet deps is NOT a failure — it may be
+            # waiting on a pending approval upstream.
+            continue
+
+        # Auto-approve harmless draft-only tasks; real sends stay gated.
+        desc_lower = task.get("description", "").lower()
+        draft_only = any(token in desc_lower for token in (
+            "draft", "drafts only", "do not send", "don't send"
+        ))
+
+        if task.get("requires_approval") and not draft_only:
+            approval_id = None
+            try:
+                async with SessionFactory() as approval_db:
+                    from uuid import UUID as _UUID
+                    tenant_id = state.get("tenant_id")
+                    run_id_raw = state.get("run_id") or ""
+                    proposed = {
+                        "agent_type": agent_type,
+                        "task_description": task.get("description", ""),
+                        "context_preview": {
+                            "user_request": state.get("user_request", ""),
+                            "analysis": state.get("analysis", {}),
+                            "dependency_task_ids": task.get("dependencies", []),
+                        },
+                    }
+                    row = Approval(
+                        tenant_id=_UUID(str(tenant_id)) if tenant_id else None,
+                        run_id=_UUID(run_id_raw) if run_id_raw else None,
+                        task_id=task_id,
+                        agent_type=agent_type,
+                        reason=task.get("approval_reason") or "human approval required",
+                        proposed_action=proposed,
+                        task_description=task.get("description", ""),
+                        status="pending",
+                    )
+                    approval_db.add(row)
+                    await approval_db.commit()
+                    await approval_db.refresh(row)
+                    approval_id = str(row.id)
+                    await audit(
+                        tenant_id=tenant_id,
+                        actor_user_id=None,
+                        event_type="approval.created",
+                        subject_type="approval",
+                        subject_id=approval_id,
+                        run_id=run_id_raw or None,
+                        payload={
+                            "task_id": task_id,
+                            "agent_type": agent_type,
+                            "reason": proposed.get("reason", ""),
+                            "task_description": proposed.get("task_description", ""),
+                        },
+                    )
+            except Exception as exc:
+                results.append({
+                    "task_id": task_id,
+                    "agent_type": agent_type,
+                    "status": "failed",
+                    "error": f"could not persist approval: {exc}",
+                })
+                any_failed = True
+                continue
+
+            results.append({
+                "task_id": task_id,
+                "agent_type": agent_type,
+                "status": "pending_approval",
+                "approval_id": approval_id,
+                "reason": task.get("approval_reason") or "human approval required",
+            })
+            if run_id:
+                bus.emit(run_id, "task_pending_approval",
+                         task_id=task_id, agent_type=agent_type,
+                         approval_id=approval_id)
+            continue
+
+        agent = _AGENTS.get(agent_type)
+        if agent is None:
+            results.append({
+                "task_id": task_id,
+                "agent_type": agent_type,
+                "status": "skipped",
+                "reason": f"no agent registered for type '{agent_type}'",
+            })
+            # Unknown agent is a configuration error, still not a task failure;
+            # surface it but don't fail the run when the rest succeeded.
+            continue
+
+        # Gather outputs of this task's dependencies (and any other completed tasks).
+        dep_results = {
+            tid: r for tid, r in task_outputs.items()
+            if tid in set(task.get("dependencies", []))
+        }
+        other_results = {
+            tid: r for tid, r in task_outputs.items()
+            if tid not in dep_results
+        }
+
+        try:
+            output = await agent.run(
+                AgentInput(
+                    task_description=task.get("description", ""),
+                    context={
+                        "user_request": state.get("user_request", ""),
+                        "analysis": state.get("analysis", {}),
+                        "tenant_id": state.get("tenant_id"),
+                        "dependency_outputs": dep_results,
+                        "other_task_outputs": other_results,
+                    },
+                )
+            )
+        except Exception as exc:
+            results.append({
+                "task_id": task_id,
+                "agent_type": agent_type,
+                "status": "failed",
+                "error": f"agent raised: {exc}",
+            })
+            any_failed = True
+            continue
+
+        if output.success:
+            results.append({
+                "task_id": task_id,
+                "agent_type": agent_type,
+                "status": "done",
+                "result": output.result,
+            })
+            completed.add(task_id)
+            task_outputs[task_id] = output.result
+            await audit(
+                tenant_id=state.get("tenant_id"),
+                actor_user_id=None,
+                event_type="agent.executed",
+                subject_type="task",
+                subject_id=task_id,
+                run_id=run_id or None,
+                payload={
+                    "agent_type": agent_type,
+                    "status": "done",
+                    "result_keys": list(output.result.keys()),
+                    "tasks_created": output.result.get("tasks_created", []),
+                },
+            )
+            # --- emit: task_done ---
+            if run_id:
+                bus.emit(run_id, "task_done", task_id=task_id, agent_type=agent_type, result=output.result)
+        else:
+            results.append({
+                "task_id": task_id,
+                "agent_type": agent_type,
+                "status": "failed",
+                "error": output.error,
+            })
+            any_failed = True
+            await audit(
+                tenant_id=state.get("tenant_id"),
+                actor_user_id=None,
+                event_type="agent.failed",
+                subject_type="task",
+                subject_id=task_id,
+                run_id=run_id or None,
+                payload={
+                    "agent_type": agent_type,
+                    "error": output.error,
+                },
+            )
+            # --- emit: task_failed ---
+            if run_id:
+                bus.emit(run_id, "task_failed", task_id=task_id, agent_type=agent_type, error=output.error)
+
+    has_pending_approval = any(
+        r.get("status") == "pending_approval" for r in results
+    )
+    if any_failed:
+        final_status = "failed"
+    elif has_pending_approval:
+        final_status = "pending_approval"
+    else:
+        final_status = "completed"
+
+    # --- emit: execution_end ---
+    if run_id:
+        bus.emit(run_id, "execution_end", status=final_status, results=results)
+
+    return {
+        "task_results": results,
+        "status": final_status,
+    }
+
+
+# --------------------------------------------------
+# 8. Workflow Routing
+# --------------------------------------------------
+
+def route_after_analysis(state: OrchestratorState) -> str:
+    if state.get("status") == "planning":
+        return "create_plan"
+    return "end"
+
+
+def route_after_planning(state: OrchestratorState) -> str:
+    if state.get("status") == "executing":
+        return "execute_tasks"
+    return "end"
+
+
+# --------------------------------------------------
+# 9. Build LangGraph Workflow
+# --------------------------------------------------
+
+workflow = StateGraph(OrchestratorState)
+
+workflow.add_node("analyze_request", analyze_request)
+workflow.add_node("create_plan", create_plan)
+workflow.add_node("execute_tasks", execute_tasks)
+
+workflow.set_entry_point("analyze_request")
+
+workflow.add_conditional_edges(
+    "analyze_request",
+    route_after_analysis,
+    {
+        "create_plan": "create_plan",
+        "end": END,
+    },
+)
+
+workflow.add_conditional_edges(
+    "create_plan",
+    route_after_planning,
+    {
+        "execute_tasks": "execute_tasks",
+        "end": END,
+    },
+)
+
+workflow.add_edge("execute_tasks", END)
+
+orchestrator = workflow.compile()
+
+
+# --------------------------------------------------
+# 10. Public Orchestrator Function (async)
+# --------------------------------------------------
+
+async def run_orchestrator(user_request: str, run_id: str = "", tenant_id: str = "") -> dict:
+    if not user_request or not user_request.strip():
+        raise ValueError("User request cannot be empty.")
+
+    initial_state: OrchestratorState = {
+        "user_request": user_request.strip(),
+        "run_id": run_id,
+        "tenant_id": tenant_id,
+        "analysis": {},
+        "tasks": [],
+        "execution_notes": [],
+        "task_results": [],
+        "status": "received",
+        "error": "",
+    }
+
+    return await orchestrator.ainvoke(initial_state)
+
+
+
+
+
+

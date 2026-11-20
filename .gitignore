@@ -20,3 +20,18 @@ wheels/
 .DS_Store
 Thumbs.db
 *.log
+
+# Ad-hoc debug/test JSON dumps from local testing
+c1.json
+c2.json
+c3.json
+login.json
+login_b.json
+login_b_resp.json
+login_resp.json
+payload.json
+reg.json
+reg_b.json
+reg_b_resp.json
+run_a.json
+runs_a.json

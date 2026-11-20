@@ -1,0 +1,33 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in · Nexora AI</title>
+  <link rel="stylesheet" href="/app/css/styles.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-card">
+      <h1>Nexora AI</h1>
+      <p class="subtitle">Command Center</p>
+
+      <form id="login-form" autocomplete="on">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" required
+               autocomplete="username" placeholder="you@company.com">
+
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" required
+               autocomplete="current-password" placeholder="••••••••">
+
+        <button type="submit" class="primary" id="login-btn">Sign in</button>
+
+        <div class="login-error" id="login-error"></div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/app/js/auth.js"></script>
+</body>
+</html>
