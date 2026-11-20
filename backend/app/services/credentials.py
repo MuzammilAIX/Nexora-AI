@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tenant-scoped credential resolver.
 
 Looks up an integration credential for a specific tenant:
@@ -103,4 +103,72 @@ async def get_hubspot_token(tenant_id: str | UUID | None) -> str:
     raise IntegrationNotConnected(
         "No HubSpot integration is connected for this tenant. "
         "Ask an admin to connect HubSpot in Settings > Integrations."
+    )
+
+async def get_gmail_token(tenant_id: str | UUID | None) -> str:
+    """
+    Return a decrypted Gmail token for this tenant.
+
+    Same structure as get_hubspot_token but for provider='gmail'.
+    Dev-mode fallback uses settings.GMAIL_ACCESS_TOKEN if set.
+    """
+    if tenant_id:
+        try:
+            tenant_uuid = UUID(str(tenant_id))
+        except (ValueError, AttributeError):
+            tenant_uuid = None
+
+        if tenant_uuid is not None:
+            try:
+                async with SessionFactory() as db:
+                    integ_stmt = (
+                        select(Integration)
+                        .where(Integration.tenant_id == tenant_uuid)
+                        .where(Integration.provider == "gmail")
+                        .limit(1)
+                    )
+                    integration = (
+                        await db.execute(integ_stmt)
+                    ).scalar_one_or_none()
+
+                    if integration is not None:
+                        cred_stmt = (
+                            select(IntegrationCredential)
+                            .where(
+                                IntegrationCredential.integration_id
+                                == integration.id
+                            )
+                            .order_by(IntegrationCredential.created_at.desc())
+                            .limit(1)
+                        )
+                        cred = (
+                            await db.execute(cred_stmt)
+                        ).scalar_one_or_none()
+
+                        if cred is not None and cred.encrypted_token:
+                            try:
+                                return decrypt_token(cred.encrypted_token)
+                            except Exception as exc:
+                                log.error(
+                                    "decrypt failed for tenant %s gmail: %s",
+                                    tenant_uuid, exc,
+                                )
+            except Exception as exc:
+                log.error(
+                    "gmail credential lookup failed for tenant %s: %s",
+                    tenant_uuid, exc,
+                )
+
+    # Dev fallback
+    gmail_dev = getattr(settings, "GMAIL_ACCESS_TOKEN", "")
+    if settings.DEBUG and gmail_dev:
+        log.warning(
+            "using settings.GMAIL_ACCESS_TOKEN fallback (DEBUG mode, tenant=%s)",
+            tenant_id,
+        )
+        return gmail_dev
+
+    raise IntegrationNotConnected(
+        "No Gmail integration is connected for this tenant. "
+        "Ask an admin to connect Gmail in Settings > Integrations."
     )
