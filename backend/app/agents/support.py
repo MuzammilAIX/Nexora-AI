@@ -126,6 +126,26 @@ def _build_prompt(
     )
 
 
+
+
+def _extract_search_query(request: str) -> str:
+    """Strip common request prefixes so Gmail search gets keywords."""
+    if not request:
+        return ""
+    prefixes = [
+        "check my gmail for", "check gmail for", "search gmail for",
+        "look for emails about", "find emails about", "find tickets about",
+        "look for tickets about", "check my email for", "check email for",
+        "find support emails about", "search my gmail for",
+        "check support tickets about", "check support emails about",
+    ]
+    lowered = request.lower()
+    for p in prefixes:
+        if lowered.startswith(p):
+            return request[len(p):].strip(" :.,")
+    return request.strip()
+
+
 class SupportAgent(BaseAgent):
     name = "support"
 
@@ -139,14 +159,41 @@ class SupportAgent(BaseAgent):
             if email_id:
                 email = await get_email(tenant_id=tenant_id, message_id=email_id)
             else:
-                # No email_id - pick the highest-priority unread email
-                unread = await search_emails(tenant_id=tenant_id, limit=10)
-                email = unread[0] if unread else None
+                # No email_id — search Gmail using the user's request as the query
+                user_request = (
+                    context.get("user_request")
+                    or payload.task_description
+                    or ""
+                )
+                # Gmail search is keyword-based; strip common request prefixes
+                query = _extract_search_query(user_request)
+                matches = await search_emails(
+                    tenant_id=tenant_id, query=query, limit=10
+                )
+                if not matches and query:
+                    # Fallback: specific query found nothing; try recent emails
+                    matches = await search_emails(tenant_id=tenant_id, query="", limit=10)
+                    # Skip bounce notifications (mailer-daemon) — those aren't support tickets
+                    matches = [
+                        m for m in matches
+                        if "mailer-daemon" not in (m.get("from") or "")
+                        and "Delivery Status" not in (m.get("subject") or "")
+                    ]
+                email = matches[0] if matches else None
 
             if not email:
                 return AgentOutput(
-                    success=False,
-                    error="No email found to process",
+                    success=True,
+                    result={
+                        "action": "support_no_match",
+                        "summary": (
+                            "No support emails found in the Gmail inbox. "
+                            "The inbox may be empty or the query didn't match "
+                            "any messages."
+                        ),
+                        "gaps": ["no emails matching the request"],
+                        "requires_approval": False,
+                    },
                 )
 
             email_block = format_email(email)
@@ -191,18 +238,83 @@ class SupportAgent(BaseAgent):
                 )),
             ])
 
-            # 5. Return structured result
+            # 5. Prepare vs execute
+            prepare_only = bool(context.get("prepare_only", False))
+            draft_body = findings.draft.response_draft
+            to_addr = email.get("from", "")
+            subject = email.get("subject", "")
+
+            if prepare_only:
+                # Return the proposed action in the shape approve_approval
+                # expects for agent_type='support', action_kind='send_email'.
+                # Include BOTH shapes so the approve route's
+                # `proposed.get("thread_id")` / `proposed.get("response_draft")`
+                # checks succeed, AND `proposed_email` is available for the
+                # generic hoist path.
+                return AgentOutput(
+                    success=True,
+                    result={
+                        "action": "support_reply_prepared",
+                        "summary": findings.summary,
+                        "email_id": email.get("id"),
+                        "thread_id": thread_id,
+                        "response_draft": draft_body,
+                        "to": to_addr,
+                        "subject": f"Re: {subject}" if subject else "Re: your message",
+                        "classification": findings.classification.model_dump(),
+                        "proposed_email": {
+                            "to": to_addr,
+                            "subject": f"Re: {subject}" if subject else "Re: your message",
+                            "body": draft_body,
+                        },
+                        "action_kind": "send_email",
+                        "requires_approval": True,
+                        "approval_reason": (
+                            f"Response to {to_addr} requires human approval "
+                            "before sending (external email policy)."
+                        ),
+                        "confidence": findings.draft.confidence,
+                        "evidence_used": findings.draft.evidence_used,
+                        "gaps": findings.gaps,
+                    },
+                )
+
+            # Execute path: send via tools.gmail.draft_reply + send_approved_draft
+            from ..tools.gmail import draft_reply, send_approved_draft
+            from ..tools.audit import log_event
+
+            draft = await draft_reply(
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                body=f"To: {to_addr}\nSubject: Re: {subject}\n\n{draft_body}",
+            )
+            draft_id = (draft or {}).get("id") or (draft or {}).get("draft_id")
+            if not draft_id:
+                return AgentOutput(
+                    success=False,
+                    error="Gmail draft creation returned no id",
+                )
+            sent = await send_approved_draft(
+                tenant_id=tenant_id, draft_id=draft_id
+            )
+            await log_event(
+                tenant_id=tenant_id,
+                event_type="email.sent",
+                payload={
+                    "to": to_addr,
+                    "subject": subject,
+                    "draft_id": draft_id,
+                    "send_response": sent,
+                    "email_id": email.get("id"),
+                },
+                subject_type="workflow",
+                subject_id=draft_id,
+            )
             result = findings.model_dump()
-            result["email"] = email
-            result["customer"] = customer
-            result["knowledge_ids"] = [k.get("id") for k in knowledge]
             result["email_id"] = email.get("id")
             result["thread_id"] = thread_id
-            result["needs_send_approval"] = True
-            result["approval_reason"] = (
-                f"Response to {email.get('from')} requires human approval "
-                "before sending (external email policy)."
-            )
+            result["draft_id"] = draft_id
+            result["sent"] = sent
             return AgentOutput(success=True, result=result)
 
         except Exception as exc:

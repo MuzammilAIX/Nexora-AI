@@ -393,7 +393,7 @@ async def execute_tasks(state: OrchestratorState) -> dict:
         # to compute the actual proposed action, then decide:
         #   - if the agent says requires_approval=True -> create approval
         #   - otherwise -> execute immediately
-        if agent_type == "operations" and not draft_only:
+        if agent_type in ("operations", "support") and not draft_only:
             prep_agent = _AGENTS.get(agent_type)
             if prep_agent is not None:
                 dep_results = {
@@ -463,9 +463,9 @@ async def execute_tasks(state: OrchestratorState) -> dict:
                         "proposed_email": prep_result.get("proposed_email"),
                         "to": prep_result.get("customer_email")
                             or (prep_result.get("proposed_order") or {}).get("customer_email"),
-                        "thread_id": None,
-                        "email_id": None,
-                        "response_draft": None,
+                        "thread_id": prep_result.get("thread_id"),
+                        "email_id": prep_result.get("email_id"),
+                        "response_draft": prep_result.get("response_draft"),
                         "approval_reason": prep_result.get("approval_reason")
                             or "operations action requires human approval",
                     }

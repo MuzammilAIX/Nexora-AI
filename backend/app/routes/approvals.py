@@ -186,9 +186,25 @@ async def approve_approval(
     execution = {"success": False, "result": {}, "error": None}
 
     if action_kind == "send_email" and row.agent_type == "support":
-        thread_id = proposed.get("thread_id")
-        body = proposed.get("response_draft")
-        to_addr = proposed.get("to")
+        # Support can put fields at top level OR inside prepared_result;
+        # accept either shape.
+        prepared = proposed.get("prepared_result") or {}
+        proposed_email = proposed.get("proposed_email") or prepared.get("proposed_email") or {}
+        thread_id = (
+            proposed.get("thread_id")
+            or prepared.get("thread_id")
+            or proposed_email.get("thread_id")
+        )
+        body = (
+            proposed.get("response_draft")
+            or prepared.get("response_draft")
+            or proposed_email.get("body")
+        )
+        to_addr = (
+            proposed.get("to")
+            or prepared.get("to")
+            or proposed_email.get("to")
+        )
         if not thread_id or not body:
             execution["error"] = (
                 "proposed_action is missing thread_id or response_draft; "
@@ -196,10 +212,24 @@ async def approve_approval(
             )
         else:
             try:
+                # draft_reply expects a formatted "To: X\nSubject: Y\n\nbody"
+                # string. The support agent provides just the body text, so
+                # reconstruct the headers here.
+                subj = (
+                    proposed.get("subject")
+                    or proposed_email.get("subject")
+                    or "Re: your message"
+                )
+                to_for_header = to_addr or "customer"
+                formatted_body = (
+                    f"To: {to_for_header}\n"
+                    f"Subject: {subj}\n\n"
+                    f"{body}"
+                )
                 draft = await draft_reply(
                     tenant_id=str(row.tenant_id),
                     thread_id=thread_id,
-                    body=body,
+                    body=formatted_body,
                 )
                 draft_id = (draft or {}).get("id") or (draft or {}).get("draft_id")
                 if not draft_id:
