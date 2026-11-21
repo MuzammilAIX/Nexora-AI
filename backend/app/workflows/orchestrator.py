@@ -59,7 +59,8 @@ OPERATIONS_PATTERNS = _re.compile(
     r"\b(inventory|stock\s+level|reorder|restock|place\s+an?\s+order|"
     r"order\s+(more|\d+)|flag\s+customer|vip\s+customer|"
     r"customer\s+segment|which\s+orders|list\s+orders|"
-    r"show\s+products|what\s+products)\b",
+    r"show\s+products|what\s+products|"
+    r"send\s+(an?\s+)?email|(?<!draft\s)(?<!draft\san\s)(?<!draft\san\s)email\s+to\s+[\w.@+-]+)\b",
     _re.IGNORECASE,
 )
 

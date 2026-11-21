@@ -41,6 +41,12 @@ _APPROVABLE_AGENTS = {
     "reporting": ReportingAgent,
     "review": ReviewAgent,
     "support": SupportAgent,
+    # "operations": registered lazily below — we don't need the class to
+    # execute an operations approval because the exact prepared action is
+    # bound in proposed_action (Section 7.3). A sentinel None keeps the
+    # agent_cls is None check from raising while still preventing accidental
+    # agent re-execution here.
+    "operations": None,
 }
 
 
@@ -154,12 +160,15 @@ async def approve_approval(
     if row.status != "pending":
         raise HTTPException(status_code=409, detail=f"Already {row.status}")
 
-    agent_cls = _APPROVABLE_AGENTS.get(row.agent_type)
-    if agent_cls is None:
+    # "operations" is intentionally registered as None: we don't re-run the
+    # agent here — we execute the exact prepared action via action_kind
+    # branches below (Section 7.3). All other agents still require a class.
+    if row.agent_type not in _APPROVABLE_AGENTS:
         raise HTTPException(
             status_code=400,
             detail=f"No agent registered for '{row.agent_type}'",
         )
+    agent_cls = _APPROVABLE_AGENTS.get(row.agent_type)
 
 
     _ensure_windows_loop()
@@ -210,6 +219,77 @@ async def approve_approval(
                     }
             except Exception as exc:
                 execution["error"] = f"send failed: {exc}"
+    elif action_kind == "send_email_generic" and row.agent_type == "operations":
+        from ..tools.idempotency import (
+            check_or_mark, mark_succeeded, mark_failed,
+        )
+        from ..tools.audit import log_event
+
+        proposed_email = proposed.get("proposed_email") or {}
+        to_addr = proposed_email.get("to")
+        subject = proposed_email.get("subject")
+        email_body = proposed_email.get("body")
+
+        if not (to_addr and subject and email_body):
+            execution["error"] = (
+                "proposed_email is missing to/subject/body; "
+                "cannot execute approved send"
+            )
+        else:
+            idem_key = (
+                f"email-approved:{row.tenant_id}:{to_addr}:"
+                f"{subject}:{proposed.get('task_id', '')}"
+            )
+            is_fresh = await check_or_mark(
+                idem_key, str(row.tenant_id), "send_email_approved"
+            )
+            if not is_fresh:
+                execution["success"] = True
+                execution["result"] = {
+                    "action": "send_email",
+                    "replayed": True,
+                    "idempotency_key": idem_key,
+                }
+            else:
+                try:
+                    draft = await draft_reply(
+                        tenant_id=str(row.tenant_id),
+                        thread_id="",
+                        body=(
+                            f"To: {to_addr}\n"
+                            f"Subject: {subject}\n\n"
+                            f"{email_body}"
+                        ),
+                    )
+                    draft_id = draft.get("id") or draft.get("draft_id")
+                    if not draft_id:
+                        raise RuntimeError("gmail draft creation returned no id")
+                    sent = await send_approved_draft(
+                        tenant_id=str(row.tenant_id),
+                        draft_id=draft_id,
+                    )
+                    await mark_succeeded(idem_key, str(row.tenant_id))
+                    await log_event(
+                        tenant_id=str(row.tenant_id),
+                        event_type="email.sent",
+                        payload={
+                            "to": to_addr,
+                            "subject": subject,
+                            "draft_id": draft_id,
+                            "send_response": sent,
+                        },
+                        subject_type="workflow",
+                        subject_id=draft_id,
+                    )
+                    execution["success"] = True
+                    execution["result"] = {
+                        "action": "send_email",
+                        "to": to_addr,
+                        "draft_id": draft_id,
+                    }
+                except Exception as exc:
+                    await mark_failed(idem_key, str(row.tenant_id), str(exc))
+                    execution["error"] = f"send_email failed: {exc}"
     elif action_kind == "create_order" and row.agent_type == "operations":
         from ..tools.operations_db import insert_order
         from ..tools.idempotency import (
