@@ -4,6 +4,15 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
+import sys as _sys
+import asyncio as _asyncio
+if _sys.platform == "win32":
+    # Psycopg async mode requires SelectorEventLoop on Windows; the
+    # ProactorEventLoop default breaks every async DB call, including
+    # startup_recovery(). Set it before any app module is imported so
+    # the async engine binds to the right loop.
+    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+
 from app.config import settings
 from app.routes.orchestrator import router as orchestrator_router
 from app.routes.auth import router as auth_router
