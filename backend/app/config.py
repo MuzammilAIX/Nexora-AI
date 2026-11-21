@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +15,17 @@ class Settings(BaseSettings):
 
     OPENAI_API_KEY: str
     OPENAI_MODEL: str = "gpt-4o-mini"
+
+    # Gmail OAuth (Google Cloud Console -> APIs & Services -> Credentials)
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = (
+        "http://127.0.0.1:8001/api/v1/integrations/gmail/callback"
+    )
+
+    # Fernet key for encrypting OAuth tokens at rest in integration_credentials.
+    # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    OAUTH_TOKEN_ENCRYPTION_KEY: str = ""
     TAVILY_API_KEY: str = ""
     DATABASE_URL: str = "postgresql+psycopg://nexora_user:change_me@localhost:5432/nexora_db"
 

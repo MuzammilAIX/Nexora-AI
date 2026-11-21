@@ -12,7 +12,7 @@ import {
   Settings,
   Bell,
   Search,
-  Activity,
+  Activity as ActivityIcon,
 } from 'lucide-react'
 import { RunsAreaChart, StatusDonutChart } from './components/DashboardCharts'
 import { Login } from './components/Login'
@@ -22,6 +22,9 @@ import { CRM } from './pages/CRM'
 import { Assistant } from './pages/Assistant'
 import { Workflows } from './pages/Workflows'
 import { Executions } from './pages/Executions'
+import { Integrations } from './pages/Integrations'
+import { Activity } from './pages/Activity'
+import { Settings as SettingsPage } from './pages/Settings'
 
 const navItems = [
   { to: '/', label: 'Overview', icon: LayoutDashboard },
@@ -138,9 +141,9 @@ function App() {
               <Route path="/assistant" element={<Assistant />} />
               <Route path="/workflows" element={<Workflows />} />
               <Route path="/executions" element={<Executions />} />
-              <Route path="/integrations" element={<Placeholder title="Integrations" subtitle="Connected external services" />} />
-              <Route path="/activity" element={<Placeholder title="Activity" subtitle="Audit trail of all events" />} />
-              <Route path="/settings" element={<Placeholder title="Settings" subtitle="Users, roles, permissions" />} />
+              <Route path="/integrations" element={<Integrations />} />
+              <Route path="/activity" element={<Activity />} />
+              <Route path="/settings" element={<SettingsPage />} />
             </Routes>
           </main>
         </div>

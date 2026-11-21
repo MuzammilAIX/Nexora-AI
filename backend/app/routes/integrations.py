@@ -1,13 +1,17 @@
-﻿"""
+"""
 Integration routes — connect / list / disconnect external services.
 Credentials are encrypted via app.crypto before storage. Never returned.
 """
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 from ..database import get_session
 from ..database.auth_models import User
@@ -18,6 +22,8 @@ from ..database.integration_models import (
 from ..auth_deps import get_current_user
 from ..crypto import encrypt_token
 from ..audit import audit
+from ..config import settings
+from ..integrations.oauth_tokens import save_tokens, load_tokens
 
 
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
@@ -148,3 +154,181 @@ async def disconnect_integration(
         payload={"provider": integration.provider},
     )
     return {"id": str(integration_id), "status": "disconnected"}
+
+# --------------------------------------------------------------- Gmail OAuth
+#
+# Flow:
+#   1. GET /integrations/gmail/connect   (authenticated)
+#        - generates a random `state`, stores it in _PENDING_STATES with the
+#          authenticated tenant_id and a 10-minute TTL
+#        - redirects to Google's consent screen
+#   2. GET /integrations/gmail/callback  (unauthenticated — Google calls it)
+#        - verifies `state` (CSRF), looks up tenant_id
+#        - exchanges `code` for access/refresh tokens via google-auth-oauthlib
+#        - fetches the account email from the Gmail profile
+#        - stores tokens via oauth_tokens.save_tokens (encrypted at rest)
+#        - returns a small HTML success page
+#
+# State is kept in-process. For multi-worker or prod, replace with a signed
+# JWT (state = jwt({tenant_id, exp})) so any worker can validate it.
+
+_PENDING_STATES: dict[str, dict] = {}
+_STATE_TTL_SECONDS = 600
+
+_GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.modify",
+]
+
+
+def _prune_states() -> None:
+    now = time.time()
+    for k, v in list(_PENDING_STATES.items()):
+        if now - v["created_at"] > _STATE_TTL_SECONDS:
+            _PENDING_STATES.pop(k, None)
+
+
+@router.get("/gmail/connect")
+async def gmail_connect(
+    user: User = Depends(get_current_user),
+):
+    """Return a URL the browser should visit to start the Gmail OAuth flow."""
+    import secrets
+    _prune_states()
+    state = secrets.token_urlsafe(32)
+    _PENDING_STATES[state] = {
+        "tenant_id": str(user.tenant_id),
+        "user_id": str(user.id) if getattr(user, "id", None) else None,
+        "created_at": time.time(),
+    }
+    params = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(_GMAIL_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    return {"authorization_url": url, "state": state}
+
+
+@router.get("/gmail/callback")
+async def gmail_callback(
+    code: str = Query(..., description="Authorization code from Google"),
+    state: str = Query(..., description="CSRF state token"),
+):
+    """Handle Google's OAuth callback: exchange code for tokens, store them."""
+    _prune_states()
+    entry = _PENDING_STATES.pop(state, None)
+    if entry is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired OAuth state. Restart the connect flow.",
+        )
+    tenant_id = entry["tenant_id"]
+
+    # Exchange the code for tokens
+    try:
+        from google_auth_oauthlib.flow import Flow
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": settings.GOOGLE_CLIENT_ID,
+                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [settings.GOOGLE_REDIRECT_URI],
+                }
+            },
+            scopes=_GMAIL_SCOPES,
+            redirect_uri=settings.GOOGLE_REDIRECT_URI,
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Token exchange failed: {exc}",
+        )
+
+    # Resolve the connected account's email
+    account_email = None
+    try:
+        from googleapiclient.discovery import build
+        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        profile = svc.users().getProfile(userId="me").execute()
+        account_email = profile.get("emailAddress")
+    except Exception:
+        pass
+
+    expires_at = creds.expiry.replace(tzinfo=timezone.utc) if creds.expiry else None
+
+    await save_tokens(
+        tenant_id=tenant_id,
+        provider="gmail",
+        access_token=creds.token,
+        refresh_token=creds.refresh_token,
+        expires_at=expires_at,
+        scopes=list(creds.scopes or _GMAIL_SCOPES),
+        account_email=account_email,
+        connected_by=entry.get("user_id"),
+    )
+
+    await audit(
+        tenant_id=tenant_id,
+        actor_user_id=entry.get("user_id"),
+        event_type="integration.connected",
+        subject_type="integration",
+        subject_id=None,
+        payload={
+            "provider": "gmail",
+            "account_email": account_email,
+            "scopes": list(creds.scopes or _GMAIL_SCOPES),
+        },
+    )
+
+    return {
+        "status": "connected",
+        "provider": "gmail",
+        "account_email": account_email,
+    }
+
+
+@router.delete("/gmail/disconnect")
+async def gmail_disconnect(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Revoke the stored Gmail credentials for this tenant."""
+    from ..integrations.oauth_tokens import delete_tokens
+    ok = await delete_tokens(tenant_id=str(user.tenant_id), provider="gmail")
+    if not ok:
+        raise HTTPException(status_code=404, detail="Gmail not connected")
+    await audit(
+        tenant_id=str(user.tenant_id),
+        actor_user_id=str(user.id) if getattr(user, "id", None) else None,
+        event_type="integration.disconnected",
+        subject_type="integration",
+        subject_id=None,
+        payload={"provider": "gmail"},
+    )
+    return {"status": "disconnected", "provider": "gmail"}
+
+@router.get("/hubspot/contacts")
+async def list_hubspot_contacts(
+    user: User = Depends(get_current_user),
+):
+    """Fetch real contacts from HubSpot for the CRM page."""
+    from ..tools.crm import search_contacts
+    try:
+        contacts = await search_contacts(tenant_id=str(user.tenant_id), limit=50)
+        return contacts
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to fetch HubSpot contacts: {exc}",
+        )
+

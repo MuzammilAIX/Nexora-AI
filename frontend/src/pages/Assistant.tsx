@@ -1,11 +1,13 @@
-import { useState, useRef, useEffect } from 'react'
-import { Bot, Send, User, Sparkles, AlertCircle, CheckCircle2, ChevronRight } from 'lucide-react'
+﻿import { useState, useRef, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Bot, Send, User, Sparkles, AlertCircle, CheckCircle2, ChevronRight, ShieldAlert } from 'lucide-react'
 
 export function Assistant() {
   const [messages, setMessages] = useState<any[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const navigate = useNavigate()
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -151,6 +153,14 @@ export function Assistant() {
                     {msg.final && (
                       <div className="space-y-4">
                         <p>{msg.content}</p>
+                        {msg.final.state?.status === 'pending_approval' && (
+                          <button 
+                            onClick={() => navigate('/mission-control')}
+                            className="mt-2 w-full py-2 bg-warning/20 text-warning border border-warning/30 rounded-lg flex items-center justify-center gap-2 hover:bg-warning/30 transition-colors font-medium"
+                          >
+                            <ShieldAlert className="w-4 h-4" /> Review in Mission Control
+                          </button>
+                        )}
                         {msg.final.state?.tasks && (
                           <div className="mt-4 border-t border-border pt-4">
                             <p className="text-xs font-semibold text-muted uppercase tracking-wider mb-2">Plan Execution</p>
@@ -160,7 +170,7 @@ export function Assistant() {
                                 return (
                                   <div key={i} className="bg-background rounded-lg p-3 border border-border flex items-start gap-3">
                                     <div className="mt-0.5">
-                                      {res.status === 'completed' ? <CheckCircle2 className="w-4 h-4 text-success" /> : <ChevronRight className="w-4 h-4 text-warning" />}
+                                      {res.status === 'completed' || res.status === 'done' ? <CheckCircle2 className="w-4 h-4 text-success" /> : <ChevronRight className="w-4 h-4 text-warning" />}
                                     </div>
                                     <div>
                                       <p className="text-xs text-white">{task.description}</p>
