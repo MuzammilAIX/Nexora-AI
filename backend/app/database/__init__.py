@@ -1,4 +1,4 @@
-﻿from sqlalchemy.ext.asyncio import (
+from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -32,3 +32,19 @@ async def get_session() -> AsyncSession:
     """FastAPI dependency: yield a session, auto-close on request end."""
     async with SessionFactory() as session:
         yield session
+
+# ---------------------------------------------------------------
+# Model registration (deferred to avoid circular import with Base)
+# ---------------------------------------------------------------
+# SQLAlchemy resolves string FKs like ForeignKey("runs.id") against the
+# metadata registry. That requires every referenced model to have been
+# imported at least once before the mapper is configured. Without these
+# imports, writes to audit_events / approvals fail with:
+#   "Foreign key associated with column 'X.run_id' could not find table
+#    'runs' with which to generate a foreign key to target column 'id'"
+from .models import Run  # noqa: F401,E402
+from .audit_models import AuditEvent  # noqa: F401,E402
+from .approval_models import Approval  # noqa: F401,E402
+from .auth_models import User, Tenant  # noqa: F401,E402
+from .integration_models import Integration, IntegrationCredential  # noqa: F401,E402
+

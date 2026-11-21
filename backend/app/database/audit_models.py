@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timezone
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from sqlalchemy import String, DateTime, ForeignKey, JSON
@@ -36,8 +36,10 @@ class AuditEvent(Base):
     subject_type: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     subject_id: Mapped[str] = mapped_column(String(128), nullable=False, default="", index=True)
     run_id: Mapped[UUID | None] = mapped_column(
+        # NOT a ForeignKey: audit_events is append-only and must not be
+        # constrained by mutable operational tables (Section 9). Join by
+        # UUID at query time if referential integrity is needed.
         PG_UUID(as_uuid=True),
-        ForeignKey("runs.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
