@@ -1,4 +1,4 @@
-﻿"""
+"""
 Approval routes — human-in-the-loop gate for sensitive agent actions.
 """
 import asyncio
@@ -19,6 +19,7 @@ from ..agents.email import EmailAgent
 from ..agents.research import ResearchAgent
 from ..agents.reporting import ReportingAgent
 from ..agents.review import ReviewAgent
+from ..agents.support import SupportAgent
 from ..audit import audit
 
 
@@ -39,6 +40,7 @@ _APPROVABLE_AGENTS = {
     "research": ResearchAgent,
     "reporting": ReportingAgent,
     "review": ReviewAgent,
+    "support": SupportAgent,
 }
 
 
@@ -159,56 +161,98 @@ async def approve_approval(
             detail=f"No agent registered for '{row.agent_type}'",
         )
 
+
     _ensure_windows_loop()
 
     proposed = row.proposed_action or {}
-    context = dict(proposed.get("context_preview") or {})
-    context["create_tasks"] = True
-    context["approved_by"] = str(user.id)
-    context["approval_id"] = str(row.id)
-    # Tenant scoping for credential resolution: use the approval row's
-    # tenant, not the requester's, so cross-tenant re-runs can't happen.
-    context["tenant_id"] = str(row.tenant_id)
-
-    agent = agent_cls()
-    try:
-        output = await agent.run(
-            AgentInput(
-                task_description=row.task_description,
-                context=context,
-            )
-        )
-    except Exception as exc:
-        row.execution_result = {"success": False, "error": str(exc)}
-        await session.commit()
-        raise HTTPException(status_code=500, detail=f"Agent execution failed: {exc}")
+    action_kind = proposed.get("action_kind") or "execute_agent"
 
     from datetime import datetime, timezone
-    row.status = "approved"
-    row.decided_by = user.id
-    row.decided_at = datetime.now(timezone.utc)
-    row.execution_result = {
-        "success": output.success,
-        "result": output.result,
-        "error": output.error,
-    }
+    from ..tools.gmail import draft_reply, send_approved_draft
+
+    # ------------------------------------------------------------
+    # Execute the EXACT prepared action. Do NOT re-run the agent.
+    # Section 7.3: "Approval must be bound to the exact action."
+    # ------------------------------------------------------------
+    execution = {"success": False, "result": {}, "error": None}
+
+    if action_kind == "send_email" and row.agent_type == "support":
+        thread_id = proposed.get("thread_id")
+        body = proposed.get("response_draft")
+        to_addr = proposed.get("to")
+        if not thread_id or not body:
+            execution["error"] = (
+                "proposed_action is missing thread_id or response_draft; "
+                "cannot execute approved send"
+            )
+        else:
+            try:
+                draft = await draft_reply(
+                    tenant_id=str(row.tenant_id),
+                    thread_id=thread_id,
+                    body=body,
+                )
+                draft_id = (draft or {}).get("id") or (draft or {}).get("draft_id")
+                if not draft_id:
+                    execution["error"] = "Gmail draft creation returned no id"
+                else:
+                    sent = await send_approved_draft(
+                        tenant_id=str(row.tenant_id),
+                        draft_id=draft_id,
+                    )
+                    execution["success"] = True
+                    execution["result"] = {
+                        "action": "email_sent",
+                        "to": to_addr,
+                        "thread_id": thread_id,
+                        "draft_id": draft_id,
+                        "send_response": sent,
+                    }
+            except Exception as exc:
+                execution["error"] = f"send failed: {exc}"
+    else:
+        execution["success"] = True
+        execution["result"] = {
+            "action": "noop",
+            "note": f"agent_type '{row.agent_type}' has no executor yet",
+        }
+
+    if execution["success"]:
+        row.status = "executed"
+        row.decided_by = user.id
+        row.decided_at = datetime.now(timezone.utc)
+    else:
+        row.status = "pending"
+
+    row.execution_result = execution
     await session.commit()
 
     await audit(
         tenant_id=user.tenant_id,
         actor_user_id=user.id,
-        event_type="approval.approved",
+        event_type=(
+            "approval.executed" if execution["success"]
+            else "approval.execute_failed"
+        ),
         subject_type="approval",
         subject_id=str(row.id),
         run_id=str(row.run_id) if row.run_id else None,
         payload={
             "task_id": row.task_id,
             "agent_type": row.agent_type,
-            "success": output.success,
-            "tasks_created": (output.result or {}).get("tasks_created", []),
-            "error": output.error,
+            "action_kind": action_kind,
+            "to": proposed.get("to"),
+            "thread_id": proposed.get("thread_id"),
+            "success": execution["success"],
+            "error": execution["error"],
         },
     )
+
+    if not execution["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Approval execution failed: {execution['error']}",
+        )
 
     return {
         "id": str(row.id),

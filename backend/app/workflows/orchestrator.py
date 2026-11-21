@@ -30,10 +30,10 @@ def _force_lead_agent(user_request: str) -> bool:
     return bool(CRM_PATTERNS.search(user_request or ""))
 
 SUPPORT_PATTERNS = _re.compile(
-    r"\\b(support\s+(email|ticket|request)|customer\s+(email|complaint|question)|"
+    r"\b(support\s+(email|ticket|request)|customer\s+(email|complaint|question)|"
     r"reply\s+to\s+(that\s+|the\s+)?(support\s+)?(email|ticket)|"
     r"respond\s+to\s+(the\s+)?(customer|support)|"
-    r"draft\s+(a\s+)?(response|reply)\s+(to\s+)?(the\s+)?(customer|support))\\b",
+    r"draft\s+(a\s+)?(response|reply)\s+(to\s+)?(the\s+)?(customer|support))\b",
     _re.IGNORECASE,
 )
 
@@ -226,13 +226,32 @@ def create_plan(state: OrchestratorState) -> dict:
             )
 
         # Deterministic override: if the request is clearly support-related,
-        # rewrite the FIRST task to use the support agent.
-        if _force_support_agent(state.get("user_request", "")) and tasks:
-            tasks[0]["agent_type"] = "support"
-            tasks[0]["requires_approval"] = True
-            tasks[0]["approval_reason"] = (
-                "Sending external emails requires human approval."
-            )
+        # REPLACE the entire LLM plan with a single support task.
+        # Rationale: the LLM planner decomposes support requests into
+        # support+email tasks, which causes duplicate approvals and unclear
+        # approval contracts. One task = one draft = one approval.
+        #
+        # NOTE: the task description deliberately AVOIDS the word "draft"
+        # because execute_tasks uses a naive `"draft" in description`
+        # check to auto-approve draft-only tasks. If the description
+        # contained "draft", the approval gate would be skipped entirely
+        # and no approval would be created.
+        if _force_support_agent(state.get("user_request", "")):
+            tasks = [{
+                "task_id": "1",
+                "description": (
+                    "Load the relevant support email, classify the issue, "
+                    "look up the customer, retrieve relevant knowledge, "
+                    "and compose a grounded response ready to send."
+                ),
+                "agent_type": "support",
+                "dependencies": [],
+                "requires_approval": True,
+                "approval_reason": (
+                    "Sending external emails requires human approval "
+                    "before delivery."
+                ),
+            }]
 
         return {
             "tasks": tasks,
@@ -291,29 +310,99 @@ async def execute_tasks(state: OrchestratorState) -> dict:
             "draft", "drafts only", "do not send", "don't send"
         ))
 
+        # ------------------------------------------------------------
+        # Approval-required task: RUN the agent in "prepare" mode first.
+        # The agent produces the exact proposed action (e.g. the email
+        # draft). We persist that EXACT payload into proposed_action and
+        # do NOT re-run the agent at approval time. This satisfies
+        # Section 7.3: "Approval must be bound to the exact action."
+        # ------------------------------------------------------------
         if task.get("requires_approval") and not draft_only:
+            prep_agent = _AGENTS.get(agent_type)
+            if prep_agent is None:
+                results.append({
+                    "task_id": task_id,
+                    "agent_type": agent_type,
+                    "status": "skipped",
+                    "reason": f"no agent registered for type '{agent_type}'",
+                })
+                continue
+
+            dep_results = {
+                tid: r for tid, r in task_outputs.items()
+                if tid in set(task.get("dependencies", []))
+            }
+            other_results = {
+                tid: r for tid, r in task_outputs.items()
+                if tid not in dep_results
+            }
+
+            try:
+                prep_output = await prep_agent.run(
+                    AgentInput(
+                        task_description=task.get("description", ""),
+                        context={
+                            "user_request": state.get("user_request", ""),
+                            "analysis": state.get("analysis", {}),
+                            "tenant_id": state.get("tenant_id"),
+                            "dependency_outputs": dep_results,
+                            "other_task_outputs": other_results,
+                            "prepare_only": True,
+                        },
+                    )
+                )
+            except Exception as exc:
+                results.append({
+                    "task_id": task_id,
+                    "agent_type": agent_type,
+                    "status": "failed",
+                    "error": f"agent prepare raised: {exc}",
+                })
+                any_failed = True
+                continue
+
+            if not prep_output.success:
+                results.append({
+                    "task_id": task_id,
+                    "agent_type": agent_type,
+                    "status": "failed",
+                    "error": prep_output.error,
+                })
+                any_failed = True
+                continue
+
+            prep_result = prep_output.result or {}
+            proposed_action = {
+                "agent_type": agent_type,
+                "task_description": task.get("description", ""),
+                "prepared_result": prep_result,
+                "action_kind": (
+                    "send_email" if agent_type == "support" else "execute_agent"
+                ),
+                "to": (prep_result.get("email") or {}).get("from"),
+                "thread_id": prep_result.get("thread_id"),
+                "email_id": prep_result.get("email_id"),
+                "response_draft": (prep_result.get("draft") or {}).get(
+                    "response_draft"
+                ),
+                "approval_reason": prep_result.get("approval_reason")
+                    or task.get("approval_reason")
+                    or "human approval required",
+            }
+
             approval_id = None
             try:
                 async with SessionFactory() as approval_db:
                     from uuid import UUID as _UUID
                     tenant_id = state.get("tenant_id")
                     run_id_raw = state.get("run_id") or ""
-                    proposed = {
-                        "agent_type": agent_type,
-                        "task_description": task.get("description", ""),
-                        "context_preview": {
-                            "user_request": state.get("user_request", ""),
-                            "analysis": state.get("analysis", {}),
-                            "dependency_task_ids": task.get("dependencies", []),
-                        },
-                    }
                     row = Approval(
                         tenant_id=_UUID(str(tenant_id)) if tenant_id else None,
                         run_id=_UUID(run_id_raw) if run_id_raw else None,
                         task_id=task_id,
                         agent_type=agent_type,
-                        reason=task.get("approval_reason") or "human approval required",
-                        proposed_action=proposed,
+                        reason=proposed_action["approval_reason"],
+                        proposed_action=proposed_action,
                         task_description=task.get("description", ""),
                         status="pending",
                     )
@@ -331,8 +420,10 @@ async def execute_tasks(state: OrchestratorState) -> dict:
                         payload={
                             "task_id": task_id,
                             "agent_type": agent_type,
-                            "reason": proposed.get("reason", ""),
-                            "task_description": proposed.get("task_description", ""),
+                            "action_kind": proposed_action.get("action_kind"),
+                            "to": proposed_action.get("to"),
+                            "reason": proposed_action.get("approval_reason", ""),
+                            "task_description": proposed_action.get("task_description", ""),
                         },
                     )
             except Exception as exc:
@@ -350,12 +441,16 @@ async def execute_tasks(state: OrchestratorState) -> dict:
                 "agent_type": agent_type,
                 "status": "pending_approval",
                 "approval_id": approval_id,
-                "reason": task.get("approval_reason") or "human approval required",
+                "reason": proposed_action["approval_reason"],
             })
             if run_id:
-                bus.emit(run_id, "task_pending_approval",
-                         task_id=task_id, agent_type=agent_type,
-                         approval_id=approval_id)
+                bus.emit(
+                    run_id,
+                    "task_pending_approval",
+                    task_id=task_id,
+                    agent_type=agent_type,
+                    approval_id=approval_id,
+                )
             continue
 
         agent = _AGENTS.get(agent_type)
