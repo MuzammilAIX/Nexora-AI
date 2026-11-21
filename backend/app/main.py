@@ -27,6 +27,13 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def startup_recovery():
+    """Mark stuck workflows on boot (Section 7.5)."""
+    await _recover_stuck_workflows()
+
+
+
 @app.get("/health", tags=["Health"])
 async def health_check():
     return {
@@ -51,3 +58,78 @@ from fastapi.responses import RedirectResponse
 @app.get("/", include_in_schema=False)
 async def _root_redirect():
     return RedirectResponse(url="/app/login.html")
+
+
+async def _recover_stuck_workflows() -> None:
+    """
+    Recovery scan on boot (Section 7.5).
+
+    `runs` is the actual workflow-execution table. Statuses in use:
+      - 'failed'            -> possibly recoverable if state_json exists
+      - 'completed'         -> nothing to do
+      - 'pending_approval'  -> stale if old; alert only, don't change status
+
+    We do NOT silently flip statuses; we log for visibility. Automatic
+    resume of in-flight runs is a follow-up once the orchestrator persists
+    a 'running' status row.
+    """
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import text
+    from .database import SessionFactory
+    from .tools.audit import log_event
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+    try:
+        async with SessionFactory() as session:
+            async with session.begin():
+                failed_rows = (await session.execute(
+                    text(
+                        "SELECT id, tenant_id, status, state_json "
+                        "FROM runs "
+                        "WHERE status = 'failed' "
+                        "AND state_json IS NOT NULL "
+                        "AND created_at < :cutoff"
+                    ),
+                    {"cutoff": cutoff},
+                )).mappings().all()
+
+        for r in failed_rows:
+            await log_event(
+                tenant_id=str(r["tenant_id"]) if r["tenant_id"] else None,
+                event_type="workflow.recoverable_on_boot",
+                workflow_id=str(r["id"]),
+                payload={
+                    "previous_status": r["status"],
+                    "had_state": r["state_json"] is not None,
+                },
+            )
+
+        async with SessionFactory() as session:
+            async with session.begin():
+                stale_rows = (await session.execute(
+                    text(
+                        "SELECT id, tenant_id, status, created_at "
+                        "FROM runs "
+                        "WHERE status = 'pending_approval' "
+                        "AND created_at < :cutoff"
+                    ),
+                    {"cutoff": cutoff},
+                )).mappings().all()
+
+        for r in stale_rows:
+            await log_event(
+                tenant_id=str(r["tenant_id"]) if r["tenant_id"] else None,
+                event_type="workflow.stale_approval",
+                workflow_id=str(r["id"]),
+                payload={
+                    "status": r["status"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                },
+            )
+
+        if failed_rows or stale_rows:
+            print(f"[recovery] recoverable={len(failed_rows)} stale_approvals={len(stale_rows)}")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+

@@ -13,6 +13,8 @@ from ..agents.lead import LeadAgent
 from ..agents.email import EmailAgent
 from ..agents.support import SupportAgent
 from ..agents.analytics import AnalyticsAgent
+from ..tools.retry import with_retry
+from ..tools.audit import log_event
 from ..agents.reporting import ReportingAgent
 from ..agents.review import ReviewAgent
 from ..services.event_bus import bus
@@ -371,19 +373,22 @@ async def execute_tasks(state: OrchestratorState) -> dict:
             }
 
             try:
-                prep_output = await prep_agent.run(
-                    AgentInput(
-                        task_description=task.get("description", ""),
-                        context={
-                            "user_request": state.get("user_request", ""),
-                            "analysis": state.get("analysis", {}),
-                            "tenant_id": state.get("tenant_id"),
-                            "dependency_outputs": dep_results,
-                            "other_task_outputs": other_results,
-                            "prepare_only": True,
-                        },
-                    )
-                )
+                prep_output = await with_retry(
+                prep_agent.run,
+                AgentInput(
+                    task_description=task.get("description", ""),
+                    context={
+                        "user_request": state.get("user_request", ""),
+                        "analysis": state.get("analysis", {}),
+                        "tenant_id": state.get("tenant_id"),
+                        "dependency_outputs": dep_results,
+                        "other_task_outputs": other_results,
+                        "prepare_only": True,
+                    },
+                ),
+                max_attempts=3,
+                operation=f"prep_agent.run:{prep_agent.name}",
+            )
             except Exception as exc:
                 results.append({
                     "task_id": task_id,
@@ -509,18 +514,21 @@ async def execute_tasks(state: OrchestratorState) -> dict:
         }
 
         try:
-            output = await agent.run(
-                AgentInput(
-                    task_description=task.get("description", ""),
-                    context={
-                        "user_request": state.get("user_request", ""),
-                        "analysis": state.get("analysis", {}),
-                        "tenant_id": state.get("tenant_id"),
-                        "dependency_outputs": dep_results,
-                        "other_task_outputs": other_results,
-                    },
-                )
-            )
+            output = await with_retry(
+            agent.run,
+            AgentInput(
+                task_description=task.get("description", ""),
+                context={
+                    "user_request": state.get("user_request", ""),
+                    "analysis": state.get("analysis", {}),
+                    "tenant_id": state.get("tenant_id"),
+                    "dependency_outputs": dep_results,
+                    "other_task_outputs": other_results,
+                },
+            ),
+            max_attempts=3,
+            operation=f"agent.run:{agent.name}",
+        )
         except Exception as exc:
             results.append({
                 "task_id": task_id,
