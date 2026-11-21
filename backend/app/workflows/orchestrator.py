@@ -13,6 +13,7 @@ from ..agents.lead import LeadAgent
 from ..agents.email import EmailAgent
 from ..agents.support import SupportAgent
 from ..agents.analytics import AnalyticsAgent
+from ..agents.operations import OperationsAgent
 from ..tools.retry import with_retry
 from ..tools.audit import log_event
 from ..agents.reporting import ReportingAgent
@@ -52,6 +53,20 @@ ANALYTICS_PATTERNS = _re.compile(
     r"(october|november|december|january|february|march|april|may|june|july|august|september)\s+(sales|report|numbers|performance))\b",
     _re.IGNORECASE,
 )
+
+
+OPERATIONS_PATTERNS = _re.compile(
+    r"\b(inventory|stock\s+level|reorder|restock|place\s+an?\s+order|"
+    r"order\s+(more|\d+)|flag\s+customer|vip\s+customer|"
+    r"customer\s+segment|which\s+orders|list\s+orders|"
+    r"show\s+products|what\s+products)\b",
+    _re.IGNORECASE,
+)
+
+
+def _force_operations_agent(user_request: str) -> bool:
+    """Deterministic operations-intent detector."""
+    return bool(OPERATIONS_PATTERNS.search(user_request or ""))
 
 
 def _force_analytics_agent(user_request: str) -> bool:
@@ -164,6 +179,7 @@ _AGENTS = {
     "review": ReviewAgent(),
     "support": SupportAgent(),
     "analytics": AnalyticsAgent(),
+    "operations": OperationsAgent(),
 }
 
 
@@ -217,7 +233,7 @@ def create_plan(state: OrchestratorState) -> dict:
                     "You may ONLY use these agent_type values: "
                     "'research' (find companies, people, facts), "
                     "'email' (draft email content), "
-                    "'reporting' (produce structured business reports), 'support' (handle customer support emails: classify issue, look up customer, draft response), 'analytics' (retrieve sales data, compute metrics, generate business reports), "
+                    "'reporting' (produce structured business reports), 'support' (handle customer support emails: classify issue, look up customer, draft response), 'analytics' (retrieve sales data, compute metrics, generate business reports), 'operations' (inventory, orders, customers), "
                     "'review' (critique outputs of prior tasks for accuracy, "
                     "missing info, and quality). "
                     "If a task needs anything else, omit it or fold it into "
@@ -283,6 +299,22 @@ def create_plan(state: OrchestratorState) -> dict:
                     "report with narrative."
                 ),
                 "agent_type": "analytics",
+                "dependencies": [],
+                "requires_approval": False,
+                "approval_reason": None,
+            }]
+
+        # Deterministic override: operations requests. The agent
+        # decides whether approval is needed based on order total.
+        if _force_operations_agent(state.get("user_request", "")):
+            tasks = [{
+                "task_id": "1",
+                "description": (
+                    "Inspect inventory, query orders, or execute a "
+                    "customer operation (reorder, flag, or email) "
+                    "as requested."
+                ),
+                "agent_type": "operations",
                 "dependencies": [],
                 "requires_approval": False,
                 "approval_reason": None,

@@ -210,6 +210,65 @@ async def approve_approval(
                     }
             except Exception as exc:
                 execution["error"] = f"send failed: {exc}"
+    elif action_kind == "create_order" and row.agent_type == "operations":
+        from ..tools.operations_db import insert_order
+        from ..tools.idempotency import (
+            check_or_mark, mark_succeeded, mark_failed,
+        )
+        from ..tools.audit import log_event
+        proposed_order = proposed.get("proposed_order") or {}
+        customer_id = proposed_order.get("customer_id")
+        items = proposed_order.get("items") or []
+        total = proposed_order.get("total")
+
+        if not customer_id or not items:
+            execution["error"] = (
+                "proposed_order is missing customer_id or items"
+            )
+        else:
+            idem_key = (
+                f"order-approved:{row.tenant_id}:{customer_id}:"
+                f"{total}:{proposed.get('task_id', '')}"
+            )
+            is_fresh = await check_or_mark(
+                idem_key, str(row.tenant_id), "create_order_approved"
+            )
+            if not is_fresh:
+                execution["success"] = True
+                execution["result"] = {
+                    "action": "create_order",
+                    "replayed": True,
+                    "idempotency_key": idem_key,
+                }
+            else:
+                try:
+                    inserted = await insert_order(
+                        tenant_id=str(row.tenant_id),
+                        customer_id=customer_id,
+                        items=items,
+                        status="confirmed",
+                    )
+                    await mark_succeeded(idem_key, str(row.tenant_id))
+                    await log_event(
+                        tenant_id=str(row.tenant_id),
+                        event_type="order.created_from_approval",
+                        payload={
+                            "order_id": inserted["order_id"],
+                            "total": inserted["total"],
+                            "approval_id": str(row.id),
+                        },
+                        subject_type="workflow",
+                        subject_id=inserted["order_id"],
+                    )
+                    execution["success"] = True
+                    execution["result"] = {
+                        "action": "create_order",
+                        "order_id": inserted["order_id"],
+                        "total": inserted["total"],
+                    }
+                except Exception as exc:
+                    await mark_failed(idem_key, str(row.tenant_id), str(exc))
+                    execution["error"] = f"create_order failed: {exc}"
     else:
         execution["success"] = True
         execution["result"] = {
