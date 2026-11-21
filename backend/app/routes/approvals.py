@@ -349,12 +349,80 @@ async def approve_approval(
                 except Exception as exc:
                     await mark_failed(idem_key, str(row.tenant_id), str(exc))
                     execution["error"] = f"create_order failed: {exc}"
+    elif action_kind == "execute_agent" and row.agent_type == "lead":
+        from ..tools.crm import create_task
+        from ..tools.audit import log_event
+
+        prepared = proposed.get("prepared_result") or {}
+        scored_leads = prepared.get("scored_leads") or []
+        high_value = [l for l in scored_leads
+                      if (l.get("score") or 0) >= 70]
+
+        if not high_value:
+            execution["success"] = True
+            execution["result"] = {
+                "action": "score_leads",
+                "scored_leads": len(scored_leads),
+                "tasks_created": [],
+                "note": "no leads scored >= 70; no tasks created",
+            }
+        else:
+            tasks_created: list[str] = []
+            errors: list[dict] = []
+            for lead in high_value:
+                try:
+                    task = await create_task(
+                        tenant_id=str(row.tenant_id),
+                        subject=lead.get("follow_up_subject")
+                            or f"Follow up with {lead.get('name', 'lead')}",
+                        body=lead.get("follow_up_body") or "",
+                        contact_id=lead.get("contact_id"),
+                        due_at=None,
+                    )
+                    task_id = (task or {}).get("id")
+                    if task_id:
+                        tasks_created.append(task_id)
+                    else:
+                        errors.append({
+                            "contact_id": lead.get("contact_id"),
+                            "error": "create_task returned no id",
+                            "response": task,
+                        })
+                except Exception as exc:
+                    errors.append({
+                        "contact_id": lead.get("contact_id"),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+
+            await log_event(
+                tenant_id=str(row.tenant_id),
+                event_type="crm.tasks.created",
+                payload={
+                    "approval_id": str(row.id),
+                    "tasks_created": tasks_created,
+                    "errors": errors,
+                    "leads_processed": len(high_value),
+                },
+                subject_type="workflow",
+                subject_id=str(row.id),
+            )
+
+            execution["success"] = len(tasks_created) > 0 or len(errors) == 0
+            execution["result"] = {
+                "action": "create_lead_tasks",
+                "scored_leads": len(scored_leads),
+                "tasks_created": tasks_created,
+                "errors": errors,
+            }
+            if not execution["success"]:
+                execution["error"] = f"{len(errors)} task(s) failed"
+
     else:
-        execution["success"] = True
-        execution["result"] = {
-            "action": "noop",
-            "note": f"agent_type '{row.agent_type}' has no executor yet",
-        }
+        execution["success"] = False
+        execution["error"] = (
+            f"No executor for agent_type='{row.agent_type}' "
+            f"action_kind='{action_kind}'. Add a branch in approve_approval."
+        )
 
     if execution["success"]:
         row.status = "executed"

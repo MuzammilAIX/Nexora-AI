@@ -24,7 +24,9 @@ import re as _re
 
 
 CRM_PATTERNS = _re.compile(
-    r"\b(crm|hubspot|pipeline|existing\s+(contacts?|leads?)|follow[\s-]?up\s+(with\s+)?leads?)\b",
+    r"\b(crm|hubspot|pipeline|existing\s+(contacts?|leads?)|follow[\s-]?up\s+(with\s+)?leads?|"
+    r"find\s+(new\s+)?leads?|get\s+(new\s+)?leads?|search\s+(for\s+)?leads?|"
+    r"lead\s+list|qualify\s+leads?|score\s+leads?)\b",
     _re.IGNORECASE,
 )
 
