@@ -12,6 +12,7 @@ from ..agents.research import ResearchAgent
 from ..agents.lead import LeadAgent
 from ..agents.email import EmailAgent
 from ..agents.support import SupportAgent
+from ..agents.analytics import AnalyticsAgent
 from ..agents.reporting import ReportingAgent
 from ..agents.review import ReviewAgent
 from ..services.event_bus import bus
@@ -41,6 +42,20 @@ SUPPORT_PATTERNS = _re.compile(
 def _force_support_agent(user_request: str) -> bool:
     """Deterministic support-intent detector. True = force a 'support' task."""
     return bool(SUPPORT_PATTERNS.search(user_request or ""))
+
+ANALYTICS_PATTERNS = _re.compile(
+    r"\b(sales\s+report|monthly\s+(sales|report|revenue)|"
+    r"revenue\s+(analysis|report)|business\s+report|"
+    r"kpi|performance\s+report|"
+    r"(october|november|december|january|february|march|april|may|june|july|august|september)\s+(sales|report|numbers|performance))\b",
+    _re.IGNORECASE,
+)
+
+
+def _force_analytics_agent(user_request: str) -> bool:
+    """Deterministic analytics-intent detector. True = force an 'analytics' task."""
+    return bool(ANALYTICS_PATTERNS.search(user_request or ""))
+
 
 from ..database import SessionFactory
 from ..database.approval_models import Approval
@@ -146,6 +161,7 @@ _AGENTS = {
     "reporting": ReportingAgent(),
     "review": ReviewAgent(),
     "support": SupportAgent(),
+    "analytics": AnalyticsAgent(),
 }
 
 
@@ -199,7 +215,7 @@ def create_plan(state: OrchestratorState) -> dict:
                     "You may ONLY use these agent_type values: "
                     "'research' (find companies, people, facts), "
                     "'email' (draft email content), "
-                    "'reporting' (produce structured business reports), 'support' (handle customer support emails: classify issue, look up customer, draft response), "
+                    "'reporting' (produce structured business reports), 'support' (handle customer support emails: classify issue, look up customer, draft response), 'analytics' (retrieve sales data, compute metrics, generate business reports), "
                     "'review' (critique outputs of prior tasks for accuracy, "
                     "missing info, and quality). "
                     "If a task needs anything else, omit it or fold it into "
@@ -251,6 +267,23 @@ def create_plan(state: OrchestratorState) -> dict:
                     "Sending external emails requires human approval "
                     "before delivery."
                 ),
+            }]
+
+        # Deterministic override: analytics requests replace the plan with a
+        # single analytics task. Reports auto-prepare (Section 7.3) so
+        # requires_approval=False.
+        if _force_analytics_agent(state.get("user_request", "")):
+            tasks = [{
+                "task_id": "1",
+                "description": (
+                    "Retrieve authorized sales data, compute metrics "
+                    "deterministically in Python, and generate a business "
+                    "report with narrative."
+                ),
+                "agent_type": "analytics",
+                "dependencies": [],
+                "requires_approval": False,
+                "approval_reason": None,
             }]
 
         return {
