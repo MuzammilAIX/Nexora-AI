@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timezone
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from sqlalchemy import String, Text, DateTime, ForeignKey, JSON
@@ -21,8 +21,10 @@ class Approval(Base):
         index=True,
     )
     run_id: Mapped[UUID | None] = mapped_column(
+        # NOT a ForeignKey: approvals can be created before the run row is
+        # persisted. Join by UUID at query time if needed. The earlier
+        # audit_events fix established the same pattern for the same reason.
         PG_UUID(as_uuid=True),
-        ForeignKey("runs.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
