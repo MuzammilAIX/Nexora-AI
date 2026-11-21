@@ -384,6 +384,151 @@ async def execute_tasks(state: OrchestratorState) -> dict:
         # do NOT re-run the agent at approval time. This satisfies
         # Section 7.3: "Approval must be bound to the exact action."
         # ------------------------------------------------------------
+        # ---- Operations agent: always prepare first to decide approval ----
+        # The plan-level requires_approval flag is too coarse (it doesn't know
+        # the order total). For operations, we run the agent in prepare mode
+        # to compute the actual proposed action, then decide:
+        #   - if the agent says requires_approval=True -> create approval
+        #   - otherwise -> execute immediately
+        if agent_type == "operations" and not draft_only:
+            prep_agent = _AGENTS.get(agent_type)
+            if prep_agent is not None:
+                dep_results = {
+                    tid: r for tid, r in task_outputs.items()
+                    if tid in set(task.get("dependencies", []))
+                }
+                other_results = {
+                    tid: r for tid, r in task_outputs.items()
+                    if tid not in dep_results
+                }
+                try:
+                    prep_output = await with_retry(
+                        prep_agent.run,
+                        AgentInput(
+                            task_description=task.get("description", ""),
+                            context={
+                                "user_request": state.get("user_request", ""),
+                                "analysis": state.get("analysis", {}),
+                                "tenant_id": state.get("tenant_id"),
+                                "dependency_outputs": dep_results,
+                                "other_task_outputs": other_results,
+                                "prepare_only": True,
+                            },
+                        ),
+                        max_attempts=3,
+                        operation=f"prep_agent.run:{prep_agent.name}",
+                    )
+                except Exception as exc:
+                    results.append({
+                        "task_id": task_id,
+                        "agent_type": agent_type,
+                        "status": "failed",
+                        "error": f"operations prepare raised: {exc}",
+                    })
+                    any_failed = True
+                    continue
+
+                if not prep_output.success:
+                    results.append({
+                        "task_id": task_id,
+                        "agent_type": agent_type,
+                        "status": "failed",
+                        "error": prep_output.error,
+                    })
+                    any_failed = True
+                    continue
+
+                prep_result = prep_output.result or {}
+                agent_wants_approval = bool(
+                    prep_result.get("requires_approval")
+                )
+
+                if agent_wants_approval:
+                    # Agent decided this action needs approval -> existing approval flow
+                    # The approve route reads proposed.get("proposed_order")
+                    # (and .proposed_flag, .proposed_email) at the TOP level of
+                    # proposed_action. The agent returns those keys nested under
+                    # its own result. Hoist them so the contract holds.
+                    proposed_action = {
+                        "agent_type": agent_type,
+                        "task_description": task.get("description", ""),
+                        "task_id": task_id,
+                        "prepared_result": prep_result,
+                        "action_kind": prep_result.get("action_kind") or "execute_agent",
+                        "proposed_order": prep_result.get("proposed_order"),
+                        "proposed_flag": prep_result.get("proposed_flag"),
+                        "proposed_email": prep_result.get("proposed_email"),
+                        "to": prep_result.get("customer_email")
+                            or (prep_result.get("proposed_order") or {}).get("customer_email"),
+                        "thread_id": None,
+                        "email_id": None,
+                        "response_draft": None,
+                        "approval_reason": prep_result.get("approval_reason")
+                            or "operations action requires human approval",
+                    }
+                    approval_id = None
+                    try:
+                        async with SessionFactory() as approval_db:
+                            from uuid import UUID as _UUID
+                            tenant_id = state.get("tenant_id")
+                            run_id_raw = state.get("run_id") or ""
+                            row = Approval(
+                                tenant_id=_UUID(str(tenant_id)) if tenant_id else None,
+                                run_id=_UUID(run_id_raw) if run_id_raw else None,
+                                task_id=task_id,
+                                agent_type=agent_type,
+                                reason=proposed_action["approval_reason"],
+                                proposed_action=proposed_action,
+                                task_description=task.get("description", ""),
+                                status="pending",
+                            )
+                            approval_db.add(row)
+                            await approval_db.commit()
+                            await approval_db.refresh(row)
+                            approval_id = str(row.id)
+                            await audit(
+                                tenant_id=tenant_id,
+                                actor_user_id=None,
+                                event_type="approval.created",
+                                subject_type="approval",
+                                subject_id=approval_id,
+                                run_id=run_id_raw or None,
+                                payload={
+                                    "task_id": task_id,
+                                    "agent_type": agent_type,
+                                    "action_kind": proposed_action.get("action_kind"),
+                                    "reason": proposed_action.get("approval_reason", ""),
+                                    "task_description": proposed_action.get("task_description", ""),
+                                },
+                            )
+                    except Exception as exc:
+                        results.append({
+                            "task_id": task_id,
+                            "agent_type": agent_type,
+                            "status": "failed",
+                            "error": f"could not persist approval: {exc}",
+                        })
+                        any_failed = True
+                        continue
+
+                    results.append({
+                        "task_id": task_id,
+                        "agent_type": agent_type,
+                        "status": "pending_approval",
+                        "approval_id": approval_id,
+                        "reason": proposed_action["approval_reason"],
+                    })
+                    if run_id:
+                        bus.emit(
+                            run_id,
+                            "task_pending_approval",
+                            task_id=task_id,
+                            agent_type=agent_type,
+                            approval_id=approval_id,
+                        )
+                    continue
+                # else: agent says no approval needed — fall through to execute path
+
         if task.get("requires_approval") and not draft_only:
             prep_agent = _AGENTS.get(agent_type)
             if prep_agent is None:
