@@ -1,153 +1,231 @@
-"""
-Gmail connector.
+"""Gmail connector: read/search/send via Google Gmail API.
 
-SLICE A1: Dev-mode implementation with realistic mock inbox.
-SLICE A2: Replace mocks with real Gmail API calls + OAuth token refresh.
+Tokens come from app.integrations.oauth_tokens (encrypted at rest).
+Automatic refresh: on 401, the refresh_token from the encrypted blob
+is used to obtain a new access_token, which is written back.
 
-Data shape matches real Gmail API.
+Scope requirements:
+  https://www.googleapis.com/auth/gmail.readonly
+  https://www.googleapis.com/auth/gmail.send
+  https://www.googleapis.com/auth/gmail.modify
 """
-import sys
-import asyncio
-import uuid
+from __future__ import annotations
+
+import base64
+import logging
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 from typing import Any
 
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-def _ensure_windows_loop_policy() -> None:
-    if sys.platform == "win32":
-        try:
-            asyncio.set_event_loop_policy(
-                asyncio.WindowsSelectorEventLoopPolicy()
-            )
-        except Exception:
-            pass
+from app.config import settings
+from app.integrations.oauth_tokens import load_tokens, rotate_access_token
+
+logger = logging.getLogger(__name__)
 
 
-_MOCK_INBOX = [
-    {
-        "id": "msg-001",
-        "threadId": "thread-001",
-        "snippet": "I purchased premium yesterday but still cannot access the features...",
-        "from": "sarah@acmecorp.com",
-        "to": "support@yourcompany.com",
-        "subject": "Cannot access premium features",
-        "date": "2026-11-20T09:15:00Z",
-        "body": "Hi team,\n\nI purchased your premium subscription yesterday (order INV-2026-11-1847) but I still cannot access the premium features in my account. I tried logging out and back in but nothing changed. My account email is sarah@acmecorp.com.\n\nPlease help as soon as possible.\n\nThanks,\nSarah Chen",
-        "labels": ["INBOX", "UNREAD"],
-        "unread": True,
-    },
-    {
-        "id": "msg-002",
-        "threadId": "thread-002",
-        "snippet": "I was charged twice this month for the same subscription...",
-        "from": "mike@talltree.io",
-        "to": "billing@yourcompany.com",
-        "subject": "Duplicate charge on my account",
-        "date": "2026-11-20T10:22:00Z",
-        "body": "Hello,\n\nI noticed I was charged twice this month for the same subscription. Both charges are on my card ending in 4421. Order number is INV-2026-11-1847. Could you check and refund the duplicate charge?\n\nThanks,\nMike Rodriguez\nTall Tree Consulting",
-        "labels": ["INBOX", "UNREAD"],
-        "unread": True,
-    },
-    {
-        "id": "msg-003",
-        "threadId": "thread-003",
-        "snippet": "Our API integration is failing with 401 errors starting this morning...",
-        "from": "ops@techwave.dev",
-        "to": "api-support@yourcompany.com",
-        "subject": "URGENT: API 401 errors",
-        "date": "2026-11-20T08:45:00Z",
-        "body": "Hi,\n\nOur integration with your API is failing with 401 errors starting this morning. We are using the same API key as before and it worked yesterday. This is blocking our production system.\n\nAccount: techwave.dev\nAPI key prefix: tw_live_...\n\nPlease respond urgently.\n\nTechWave Operations",
-        "labels": ["INBOX", "UNREAD", "IMPORTANT"],
-        "unread": True,
-    },
-    {
-        "id": "msg-004",
-        "threadId": "thread-004",
-        "snippet": "Quick question about upgrading my plan...",
-        "from": "alex@startuplabs.co",
-        "to": "sales@yourcompany.com",
-        "subject": "Question about enterprise plan",
-        "date": "2026-11-19T16:30:00Z",
-        "body": "Hi,\n\nWe are evaluating your platform for our team of 25 and wanted to ask about the enterprise plan pricing and features. Can we set up a demo call next week?\n\nBest,\nAlex Brown\nStartup Labs",
-        "labels": ["INBOX"],
-        "unread": False,
-    },
-]
+PROVIDER = "gmail"
 
-_DEV_DRAFTS = {}
+
+class GmailNotConnected(RuntimeError):
+    """Raised when no Gmail integration exists for the tenant."""
 
 
 class GmailConnector:
-    provider = "gmail"
+    def __init__(self, tenant_id: str):
+        self.tenant_id = str(tenant_id)
 
-    def __init__(self, access_token: str | None = None):
-        self.access_token = access_token
-        self._dev_mode = not access_token
+    # ------------------------------------------------------------- auth
 
-    async def search_emails(
-        self, query: str = "", max_results: int = 20
+    async def _get_credentials(self) -> Credentials:
+        tokens = await load_tokens(tenant_id=self.tenant_id, provider=PROVIDER)
+        if not tokens:
+            raise GmailNotConnected(
+                f"Gmail not connected for tenant {self.tenant_id}. "
+                f"Visit /api/v1/integrations/gmail/connect to authorize."
+            )
+
+        creds = Credentials(
+            token=tokens["access_token"],
+            refresh_token=tokens.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=settings.GOOGLE_CLIENT_ID,
+            client_secret=settings.GOOGLE_CLIENT_SECRET,
+            scopes=tokens.get("scopes") or None,
+        )
+        exp = tokens.get("expires_at")
+        if exp:
+            try:
+                creds.expiry = datetime.fromisoformat(exp).astimezone(timezone.utc).replace(tzinfo=None)
+            except (ValueError, TypeError):
+                pass
+
+        if not creds.valid:
+            if not creds.refresh_token:
+                raise GmailNotConnected(
+                    "Gmail access token expired and no refresh_token stored. "
+                    "Re-run /api/v1/integrations/gmail/connect."
+                )
+            creds.refresh(GoogleRequest())
+            await rotate_access_token(
+                tenant_id=self.tenant_id,
+                provider=PROVIDER,
+                new_access_token=creds.token,
+                new_expires_at=creds.expiry.replace(tzinfo=timezone.utc)
+                    if creds.expiry else None,
+            )
+        return creds
+
+    async def _service(self):
+        creds = await self._get_credentials()
+        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+    # --------------------------------------------------------- messages
+
+    async def search_messages(
+        self, query: str, max_results: int = 10
     ) -> list[dict[str, Any]]:
-        _ensure_windows_loop_policy()
-        if self._dev_mode:
-            emails = [e for e in _MOCK_INBOX if e.get("unread", False)]
-            if query:
-                q = query.lower()
-                emails = [
-                    e for e in emails
-                    if q in e.get("subject", "").lower()
-                    or q in e.get("body", "").lower()
-                    or q in e.get("from", "").lower()
-                ]
-            return emails[:max_results]
-        raise NotImplementedError("Real Gmail API not yet wired. Slice A2.")
+        """Search messages. Returns [{id, threadId, subject, from, snippet, internalDate}]"""
+        svc = await self._service()
+        result = svc.users().messages().list(
+            userId="me", q=query, maxResults=max_results
+        ).execute()
+        messages = result.get("messages", [])
+        out = []
+        for m in messages:
+            try:
+                meta = svc.users().messages().get(
+                    userId="me", id=m["id"], format="metadata",
+                    metadataHeaders=["Subject", "From", "Date"],
+                ).execute()
+                headers = {h["name"].lower(): h["value"]
+                           for h in meta.get("payload", {}).get("headers", [])}
+                out.append({
+                    "id": m["id"],
+                    "threadId": m.get("threadId"),
+                    "subject": headers.get("subject", ""),
+                    "from": headers.get("from", ""),
+                    "date": headers.get("date", ""),
+                    "snippet": meta.get("snippet", ""),
+                    "internalDate": meta.get("internalDate"),
+                })
+            except HttpError as exc:
+                logger.warning("metadata fetch failed for %s: %s", m["id"], exc)
+        return out
 
-    async def get_email(self, message_id: str) -> dict[str, Any] | None:
-        _ensure_windows_loop_policy()
-        if self._dev_mode:
-            for e in _MOCK_INBOX:
-                if e.get("id") == message_id:
-                    return e
-            return None
-        raise NotImplementedError("Real Gmail API not yet wired. Slice A2.")
+    async def get_message(self, message_id: str) -> dict[str, Any]:
+        """Fetch a single message with full body + headers."""
+        svc = await self._service()
+        msg = svc.users().messages().get(
+            userId="me", id=message_id, format="full"
+        ).execute()
+        headers = {h["name"].lower(): h["value"]
+                   for h in msg.get("payload", {}).get("headers", [])}
+        body = self._extract_body(msg.get("payload", {}))
+        return {
+            "id": msg["id"],
+            "threadId": msg.get("threadId"),
+            "subject": headers.get("subject", ""),
+            "from": headers.get("from", ""),
+            "to": headers.get("to", ""),
+            "date": headers.get("date", ""),
+            "snippet": msg.get("snippet", ""),
+            "body": body,
+            "internalDate": msg.get("internalDate"),
+        }
 
-    async def draft_reply(
-        self, thread_id: str, body: str
+    @staticmethod
+    def _extract_body(payload: dict) -> str:
+        """Walk the MIME tree; prefer text/plain, fall back to text/html."""
+        def decode(data: str) -> str:
+            return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode(
+                "utf-8", errors="replace"
+            )
+
+        parts = payload.get("parts") or []
+        plain, html = "", ""
+        for p in parts:
+            mime = p.get("mimeType", "")
+            data = (p.get("body") or {}).get("data")
+            if not data:
+                continue
+            if mime == "text/plain" and not plain:
+                plain = decode(data)
+            elif mime == "text/html" and not html:
+                html = decode(data)
+        if plain:
+            return plain
+        if html:
+            return html
+        data = (payload.get("body") or {}).get("data")
+        return decode(data) if data else ""
+
+    # ------------------------------------------------------------- send
+
+    async def send_message(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        thread_id: str | None = None,
+        from_email: str | None = None,
     ) -> dict[str, Any]:
-        _ensure_windows_loop_policy()
-        if self._dev_mode:
-            original = None
-            for e in _MOCK_INBOX:
-                if e.get("threadId") == thread_id:
-                    original = e
-                    break
-            if not original:
-                raise ValueError(f"Thread {thread_id} not found")
-            draft_id = f"draft-{uuid.uuid4().hex[:8]}"
-            draft = {
-                "draft_id": draft_id,
-                "thread_id": thread_id,
-                "to": original["from"],
-                "subject": f"Re: {original['subject']}",
-                "body": body,
-                "status": "draft",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            _DEV_DRAFTS[draft_id] = draft
-            return draft
-        raise NotImplementedError("Real Gmail API not yet wired. Slice A2.")
+        """Send an email. Returns {id, threadId}."""
+        svc = await self._service()
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["To"] = to
+        msg["Subject"] = subject
+        if from_email:
+            msg["From"] = from_email
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        send_body: dict[str, Any] = {"raw": raw}
+        if thread_id:
+            send_body["threadId"] = thread_id
+
+        sent = svc.users().messages().send(userId="me", body=send_body).execute()
+        return {"id": sent["id"], "threadId": sent.get("threadId")}
 
     async def send_draft(self, draft_id: str) -> dict[str, Any]:
-        _ensure_windows_loop_policy()
-        if self._dev_mode:
-            draft = _DEV_DRAFTS.get(draft_id)
-            if not draft:
-                raise ValueError(f"Draft {draft_id} not found")
-            draft["status"] = "sent"
-            draft["sent_at"] = datetime.now(timezone.utc).isoformat()
-            return {
-                "draft_id": draft_id,
-                "thread_id": draft["thread_id"],
-                "status": "sent",
-                "sent_at": draft["sent_at"],
-            }
-        raise NotImplementedError("Real Gmail API not yet wired. Slice A2.")
+        """Send an existing draft by id. Returns {id, threadId}."""
+        svc = await self._service()
+        sent = svc.users().drafts().send(
+            userId="me", body={"id": draft_id}
+        ).execute()
+        return {"id": sent["id"], "threadId": sent.get("threadId")}
+
+    async def create_draft(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a draft (not sent). Returns {id, message_id, threadId}."""
+        svc = await self._service()
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["To"] = to
+        msg["Subject"] = subject
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+        message_body: dict[str, Any] = {"raw": raw}
+        if thread_id:
+            message_body["threadId"] = thread_id
+
+        draft = svc.users().drafts().create(
+            userId="me", body={"message": message_body}
+        ).execute()
+        return {
+            "id": draft["id"],
+            "message_id": draft["message"]["id"],
+            "threadId": draft["message"].get("threadId"),
+        }
+
+
+__all__ = ["GmailConnector", "GmailNotConnected", "PROVIDER"]
