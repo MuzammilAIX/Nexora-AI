@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     # Integrations
     HUBSPOT_ACCESS_TOKEN: str = ""
     FERNET_KEY: str = ""
+    RESEND_API_KEY: str = ""
+    FRONTEND_URL: str = "http://localhost:5173"
+
+    # Gmail SMTP (used while no domain is verified in Resend)
+    GMAIL_USER: str = ""
+    GMAIL_APP_PASSWORD: str = ""
+    MAIL_FROM_NAME: str = "Nexora AI"
 
     model_config = SettingsConfigDict(
         env_file=str(ENV_FILE),

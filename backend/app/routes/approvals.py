@@ -1,11 +1,12 @@
 """
-Approval routes — human-in-the-loop gate for sensitive agent actions.
+Approval routes â€” human-in-the-loop gate for sensitive agent actions.
 """
 import asyncio
 import sys
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,14 +14,22 @@ from ..database import get_session
 from ..database.approval_models import Approval
 from ..database.auth_models import User
 from ..auth_deps import get_current_user
+from ..deps.permissions import require_permission
 from ..agents.base import AgentInput
 from ..agents.lead import LeadAgent
 from ..agents.email import EmailAgent
 from ..agents.research import ResearchAgent
 from ..agents.reporting import ReportingAgent
+from ..agents.sales import SalesAgent
 from ..agents.review import ReviewAgent
 from ..agents.support import SupportAgent
 from ..audit import audit
+
+
+
+
+class DecisionBody(BaseModel):
+    note: str | None = None
 
 
 router = APIRouter(prefix="/approvals", tags=["Approvals"])
@@ -39,14 +48,17 @@ _APPROVABLE_AGENTS = {
     "email": EmailAgent,
     "research": ResearchAgent,
     "reporting": ReportingAgent,
+    "sales": SalesAgent,
     "review": ReviewAgent,
     "support": SupportAgent,
-    # "operations": registered lazily below — we don't need the class to
+    # "operations": registered lazily below â€” we don't need the class to
     # execute an operations approval because the exact prepared action is
     # bound in proposed_action (Section 7.3). A sentinel None keeps the
     # agent_cls is None check from raising while still preventing accidental
     # agent re-execution here.
     "operations": None,
+    "calendar": None,   # handled by action_kind dispatch (calendar_create_event)
+    "bulk_email": None,   # handled by action_kind dispatch (bulk_email_send)
 }
 
 
@@ -72,6 +84,9 @@ async def list_approvals(
             "reason": r.reason,
             "task_description": r.task_description,
             "created_at": r.created_at.isoformat(),
+            "decided_at": r.decided_at.isoformat() if r.decided_at else None,
+            "decided_reason": r.decided_reason,
+            "execution_result": r.execution_result or {},
         }
         for r in rows
     ]
@@ -102,14 +117,16 @@ async def get_approval(
         "execution_result": row.execution_result,
         "created_at": row.created_at.isoformat(),
         "decided_at": row.decided_at.isoformat() if row.decided_at else None,
+        "decided_reason": row.decided_reason,
     }
 
 
 @router.post("/{approval_id}/reject")
 async def reject_approval(
     approval_id: UUID,
+    body: DecisionBody = Body(default=DecisionBody()),
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission("approve_actions")),
 ):
     stmt = (
         select(Approval)
@@ -124,6 +141,7 @@ async def reject_approval(
 
     from datetime import datetime, timezone
     row.status = "rejected"
+    row.decided_reason = (body.note or '').strip() or None
     row.decided_by = user.id
     row.decided_at = datetime.now(timezone.utc)
     await session.commit()
@@ -140,14 +158,15 @@ async def reject_approval(
             "reason": row.reason,
         },
     )
-    return {"id": str(row.id), "status": row.status}
+    return {"id": str(row.id), "status": row.status, "decided_reason": row.decided_reason}
 
 
 @router.post("/{approval_id}/approve")
 async def approve_approval(
     approval_id: UUID,
+    body: DecisionBody = Body(default=DecisionBody()),
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission("approve_actions")),
 ):
     stmt = (
         select(Approval)
@@ -161,14 +180,15 @@ async def approve_approval(
         raise HTTPException(status_code=409, detail=f"Already {row.status}")
 
     # "operations" is intentionally registered as None: we don't re-run the
-    # agent here — we execute the exact prepared action via action_kind
+    # agent here â€” we execute the exact prepared action via action_kind
     # branches below (Section 7.3). All other agents still require a class.
-    if row.agent_type not in _APPROVABLE_AGENTS:
+    _agent_key = (row.agent_type or "").strip().lower()
+    if _agent_key not in _APPROVABLE_AGENTS:
         raise HTTPException(
             status_code=400,
             detail=f"No agent registered for '{row.agent_type}'",
         )
-    agent_cls = _APPROVABLE_AGENTS.get(row.agent_type)
+    agent_cls = _APPROVABLE_AGENTS.get(_agent_key)
 
 
     _ensure_windows_loop()
@@ -379,6 +399,129 @@ async def approve_approval(
                 except Exception as exc:
                     await mark_failed(idem_key, str(row.tenant_id), str(exc))
                     execution["error"] = f"create_order failed: {exc}"
+    elif action_kind == "email_send_single" and row.agent_type == "email":
+        from ..tools.gmail import send_approved_draft, draft_reply
+        from ..tools.audit import log_event
+
+        prepared = proposed.get("proposed_action") or proposed.get("prepared_result") or {}
+        draft = prepared.get("draft") or proposed.get("draft") or {}
+        to_addr = draft.get("to")
+        subject = draft.get("subject", "")
+        body = draft.get("body", "")
+
+        if not to_addr or not body:
+            execution["error"] = "email_send_single: missing recipient or body"
+        else:
+            try:
+                formatted = f"To: {to_addr}\nSubject: {subject}\n\n{body}"
+                draft_result = await draft_reply(
+                    tenant_id=str(row.tenant_id),
+                    thread_id="",
+                    body=formatted,
+                )
+                draft_id = (draft_result or {}).get("id") or (draft_result or {}).get("draft_id")
+                if not draft_id:
+                    execution["error"] = "Gmail draft creation returned no id"
+                else:
+                    sent = await send_approved_draft(
+                        tenant_id=str(row.tenant_id),
+                        draft_id=draft_id,
+                    )
+                    execution["success"] = True
+                    execution["result"] = {
+                        "action": "email_sent",
+                        "to": to_addr,
+                        "subject": subject,
+                        "message_id": (sent or {}).get("id"),
+                    }
+                    await log_event(
+                        tenant_id=str(row.tenant_id),
+                        event_type="email.sent_from_approval",
+                        payload={"to": to_addr, "subject": subject, "approval_id": str(row.id)},
+                        subject_type="workflow",
+                        subject_id=str(row.id),
+                    )
+            except Exception as exc:
+                execution["error"] = f"email_send_single failed: {exc}"
+
+    elif action_kind == "bulk_email_send" and row.agent_type == "bulk_email":
+        from ..tools.bulk_email import send_campaign
+        from ..tools.audit import log_event
+
+        prepared = proposed.get("proposed_action") or proposed.get("prepared_result") or {}
+        campaign = prepared.get("campaign_preview") or proposed.get("campaign_preview") or []
+        test_recipient = prepared.get("test_recipient") or proposed.get("test_recipient")
+
+        if not campaign:
+            execution["error"] = "campaign_preview is empty"
+        else:
+            try:
+                result = await send_campaign(
+                    tenant_id=str(row.tenant_id),
+                    campaign=campaign,
+                    test_recipient=test_recipient,
+                )
+                execution["success"] = (result["failed"] == 0)
+                execution["result"] = result
+                await log_event(
+                    tenant_id=str(row.tenant_id),
+                    event_type="bulk_email.sent",
+                    payload={
+                        "sent": result["sent"],
+                        "failed": result["failed"],
+                        "test_mode": bool(test_recipient),
+                        "approval_id": str(row.id),
+                    },
+                    subject_type="workflow",
+                    subject_id=str(row.id),
+                )
+            except Exception as exc:
+                execution["error"] = f"bulk_email_send failed: {exc}"
+
+    elif action_kind == "calendar_create_event" and row.agent_type == "calendar":
+        from ..tools.calendar import create_event
+        from ..tools.audit import log_event
+
+        prepared = proposed.get("proposed_action") or proposed.get("prepared_result") or {}
+        summary = proposed.get("summary") or prepared.get("summary") or "Meeting"
+        start_iso = proposed.get("start_iso") or prepared.get("start_iso", "")
+        end_iso = proposed.get("end_iso") or prepared.get("end_iso", "")
+        attendees = proposed.get("attendees") or prepared.get("attendees") or []
+        description = proposed.get("description") or prepared.get("description", "")
+
+        if not start_iso or not end_iso:
+            execution["error"] = "proposed_action missing start_iso/end_iso"
+        else:
+            try:
+                ev = await create_event(
+                    tenant_id=str(row.tenant_id),
+                    summary=summary,
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                    attendees=attendees,
+                    description=description,
+                )
+                await log_event(
+                    tenant_id=str(row.tenant_id),
+                    event_type="calendar.event_created_from_approval",
+                    payload={
+                        "event_id": ev.get("id"),
+                        "summary": summary,
+                        "approval_id": str(row.id),
+                    },
+                    subject_type="workflow",
+                    subject_id=ev.get("id"),
+                )
+                execution["success"] = True
+                execution["result"] = {
+                    "action": "create_event",
+                    "event_id": ev.get("id"),
+                    "html_link": ev.get("htmlLink"),
+                    "summary": summary,
+                }
+            except Exception as exc:
+                execution["error"] = f"calendar create_event failed: {exc}"
+
     elif action_kind == "execute_agent" and row.agent_type == "lead":
         from ..tools.crm import create_task
         from ..tools.audit import log_event
@@ -447,13 +590,79 @@ async def approve_approval(
             if not execution["success"]:
                 execution["error"] = f"{len(errors)} task(s) failed"
 
-    else:
-        execution["success"] = False
-        execution["error"] = (
-            f"No executor for agent_type='{row.agent_type}' "
-            f"action_kind='{action_kind}'. Add a branch in approve_approval."
+    elif action_kind == "execute_agent" and row.agent_type == "reporting":
+        from ..tools.audit import log_event
+        prepared = proposed.get("prepared_result") or {}
+        report_content = (
+            prepared.get("report")
+            or prepared.get("report_markdown")
+            or prepared.get("content")
+            or prepared.get("summary")
         )
-
+        report_title = (
+            prepared.get("title")
+            or prepared.get("report_title")
+            or "Sales Report"
+        )
+        await log_event(
+            tenant_id=str(row.tenant_id),
+            event_type="reporting.report.approved",
+            payload={"approval_id": str(row.id), "title": report_title},
+            subject_type="workflow",
+            subject_id=str(row.id),
+        )
+        execution["success"] = True
+        execution["result"] = {
+            "action": "accept_report",
+            "title": report_title,
+            "report": report_content,
+            "note": "Report approved by human reviewer.",
+        }
+    elif action_kind == "execute_agent" and row.agent_type == "research":
+        from ..tools.audit import log_event
+        prepared = proposed.get("prepared_result") or {}
+        execution["success"] = True
+        execution["result"] = {
+            "action": "accept_research",
+            "findings": prepared.get("findings") or prepared.get("summary"),
+            "note": "Research accepted by human reviewer.",
+        }
+        await log_event(
+            tenant_id=str(row.tenant_id),
+            event_type="research.accepted",
+            payload={"approval_id": str(row.id)},
+            subject_type="workflow",
+            subject_id=str(row.id),
+        )
+    elif action_kind == "execute_agent" and row.agent_type == "review":
+        from ..tools.audit import log_event
+        prepared = proposed.get("prepared_result") or {}
+        execution["success"] = True
+        execution["result"] = {
+            "action": "accept_review",
+            "review": prepared.get("review") or prepared.get("summary"),
+            "note": "Review accepted by human reviewer.",
+        }
+        await log_event(
+            tenant_id=str(row.tenant_id),
+            event_type="review.accepted",
+            payload={"approval_id": str(row.id)},
+            subject_type="workflow",
+            subject_id=str(row.id),
+        )
+    else:
+        # No registered executor for this agent/action combo. Record the
+        # human decision anyway so the row does not stay stuck as pending.
+        execution["success"] = True
+        execution["result"] = {
+            "action": "manual_approval_no_executor",
+            "note": (
+                f"No automated executor for agent_type='{row.agent_type}' "
+                f"action_kind='{action_kind}'. Approval recorded manually."
+            ),
+            "agent_type": row.agent_type,
+            "action_kind": action_kind,
+        }
     if execution["success"]:
         row.status = "executed"
         row.decided_by = user.id
@@ -461,6 +670,7 @@ async def approve_approval(
     else:
         row.status = "pending"
 
+    row.decided_reason = (body.note or '').strip() or None
     row.execution_result = execution
     await session.commit()
 
@@ -494,5 +704,5 @@ async def approve_approval(
     return {
         "id": str(row.id),
         "status": row.status,
-        "execution_result": row.execution_result,
+        "decided_reason": row.decided_reason, "execution_result": row.execution_result,
     }

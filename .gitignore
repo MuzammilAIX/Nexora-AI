@@ -1,41 +1,61 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Environment secrets - never commit these
+# --- Secrets ---
 .env
-.env.*
-!.env.example
+.env.local
+.env.*.local
+*.pem
+*.key
 
-# IDE / OS
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Virtual environments ---
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# --- Node / Vite / React ---
+node_modules/
+dist/
+.vite/
+*.local
+
+# --- IDEs ---
 .vscode/
 .idea/
+*.swp
+*.swo
+*.sublime-*
+
+# --- OS ---
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# --- Logs / temp ---
 *.log
+logs/
+tmp/
+temp/
+*.tmp
 
-# Ad-hoc debug/test JSON dumps from local testing
-c1.json
-c2.json
-c3.json
-login.json
-login_b.json
-login_b_resp.json
-login_resp.json
-payload.json
-reg.json
-reg_b.json
-reg_b_resp.json
-run_a.json
-runs_a.json
+# --- Database dumps ---
+*.sql.gz
+*.dump
 
-# Restore-test clones (created during checkpoint verification)
-nexora-restore-test/
-*-restore-test/
+# --- Docker ---
+postgres-data/

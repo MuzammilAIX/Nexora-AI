@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -60,9 +60,10 @@ async def execute_orchestrator(
         )
 
         if result.get("status") == "failed":
+            error_detail = (result.get("error") or "").strip() or "Orchestration failed: no error detail captured. Check the orchestrator logs and OpenAI API status."
             raise HTTPException(
                 status_code=502,
-                detail=result.get("error", "Orchestration failed"),
+                detail=error_detail,
             )
 
         # pending_approval is a valid 200 — the run succeeded but is
@@ -208,3 +209,98 @@ async def get_run_by_id(
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
         "state": state,
     }
+
+AGENT_DESCRIPTIONS = {
+    "operations": "Inspect inventory, query orders, and execute customer operations with approval.",
+    "lead":       "Score leads and create CRM follow-up tasks in HubSpot with human approval.",
+    "analytics":  "Query business metrics from PostgreSQL and surface actionable insights.",
+    "research":   "Research companies, people, and topics from the open web.",
+    "reporting":  "Compile reports and route them for management review before distribution.",
+    "email":      "Draft and send outbound emails via Gmail under the approval gate.",
+    "support":    "Search Gmail, classify tickets, and draft replies that send on approval.",
+    "review":     "Quality gate for agent output before it reaches a human decision-maker.",
+    "calendar":   "Read today's/this week's calendar and propose meetings; write actions require approval.",
+    "bulk_email": "Send personalized emails to one or many recipients in a single approval-gated campaign.",
+}
+
+@router.get("/agents")
+async def list_agents(
+    user: User = Depends(get_current_user),
+):
+    """Return the list of registered AI agents and their status."""
+    from ..workflows.orchestrator import _AGENTS
+    
+    # We simulate some metrics for now, but these can be wired to real DB counts later
+    agent_data = []
+    for name, agent in _AGENTS.items():
+        agent_data.append({
+            "id": name,
+            "name": name.capitalize() + " Agent",
+            "description": AGENT_DESCRIPTIONS.get(name, getattr(agent, "description", "Specialized AI agent")),
+            "status": "active", # We can add logic later to check if a tenant has it enabled
+            "model": "gpt-4o-mini",
+            "last_run": None, 
+            "success_rate": None,
+            "total_runs": None
+        })
+    return agent_data
+
+@router.get("/tasks")
+async def list_tasks(
+    status: str = "all",
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """Flatten every task from every run for this tenant into one list."""
+    from sqlalchemy import select, desc
+    from app.database.models import Run as RunModel
+
+    stmt = (
+        select(RunModel)
+        .where(RunModel.tenant_id == user.tenant_id)
+        .order_by(desc(RunModel.created_at))
+    )
+    runs = (await session.execute(stmt)).scalars().all()
+
+    out = []
+    for run in runs:
+        if not run.state_json:
+            continue
+        try:
+            state = json.loads(run.state_json)
+        except Exception:
+            continue
+
+        planned = state.get("tasks") or []
+        results = state.get("task_results") or []
+
+        for t in planned:
+            tid = t.get("task_id")
+            result = next((r for r in results if r.get("task_id") == tid), None)
+            task_status = (result or {}).get("status") or (
+                "pending_approval" if t.get("requires_approval") else "queued"
+            )
+
+            if status != "all" and task_status != status:
+                continue
+
+            out.append({
+                "task_id": f"{run.id}:{tid}",
+                "raw_task_id": tid,
+                "run_id": str(run.id),
+                "run_request": run.user_request,
+                "run_status": run.status,
+                "created_at": run.created_at.isoformat(),
+                "agent_type": t.get("agent_type"),
+                "description": t.get("description"),
+                "dependencies": t.get("dependencies") or [],
+                "requires_approval": bool(t.get("requires_approval")),
+                "approval_reason": t.get("approval_reason"),
+                "status": task_status,
+                "approval_id": (result or {}).get("approval_id"),
+                "reason": (result or {}).get("reason"),
+                "result": (result or {}).get("result"),
+            })
+
+    return out
+

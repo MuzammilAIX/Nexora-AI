@@ -14,6 +14,7 @@ from app.database.auth_models import Tenant, User  # noqa: F401
 from app.database.integration_models import Integration, IntegrationCredential  # noqa: F401
 from app.database.approval_models import Approval  # noqa: F401
 from app.database.audit_models import AuditEvent  # noqa: F401
+from app.database.agent_models import Agent  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

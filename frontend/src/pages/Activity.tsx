@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { Activity as ActivityIcon, CheckCircle2, AlertCircle, Clock } from 'lucide-react'
 
 export function Activity() {
@@ -34,7 +34,7 @@ export function Activity() {
       <h2 className="text-2xl font-bold text-white mb-1">Activity Log</h2>
       <p className="text-sm text-muted mb-8">Audit trail of all agent actions and system events.</p>
 
-      <div className="bg-panel border border-border rounded-xl overflow-hidden">
+      <div className="bg-background border border-border rounded-xl overflow-hidden">
         {loading ? (
           <div className="p-8 text-center text-muted">Loading events...</div>
         ) : events.length === 0 ? (
@@ -42,7 +42,7 @@ export function Activity() {
         ) : (
           <table className="w-full text-left border-collapse">
             <thead>
-              <tr className="bg-[#111827] border-b border-border text-xs text-muted uppercase tracking-wider">
+              <tr className="bg-background border-b border-border text-xs text-muted uppercase tracking-wider">
                 <th className="px-6 py-4 font-medium">Event</th>
                 <th className="px-6 py-4 font-medium">Subject ID</th>
                 <th className="px-6 py-4 font-medium">Timestamp</th>
@@ -50,7 +50,7 @@ export function Activity() {
             </thead>
             <tbody className="divide-y divide-border">
               {events.map((e, i) => (
-                <tr key={i} className="hover:bg-panelHover transition-colors">
+                <tr key={i} className="hover:bg-backgroundHover transition-colors">
                   <td className="px-6 py-4 text-sm text-white flex items-center gap-2">
                     {getIcon(e.event_type)}
                     {e.event_type}

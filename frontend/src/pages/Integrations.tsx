@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { Plug, CheckCircle2, XCircle, Mail, Database, Loader2 } from 'lucide-react'
 
 export function Integrations() {
@@ -30,12 +30,18 @@ export function Integrations() {
     setConnecting('gmail')
     try {
       const res = await fetch('/api/v1/integrations/gmail/connect', { headers })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Request failed')
+      }
       const data = await res.json()
       if (data.authorization_url) {
         window.location.href = data.authorization_url
+      } else {
+        throw new Error('No authorization_url returned')
       }
-    } catch (err) {
-      alert('Failed to start Gmail OAuth')
+    } catch (err: any) {
+      alert('Failed to start Gmail OAuth: ' + (err?.message || err))
     } finally {
       setConnecting(null)
     }
@@ -78,7 +84,7 @@ export function Integrations() {
 
       <div className="grid gap-6">
         {/* Gmail Integration Card */}
-        <div className="bg-panel border border-border rounded-xl p-6 flex items-center justify-between">
+        <div className="bg-background border border-border rounded-xl p-6 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="w-12 h-12 rounded-lg bg-red-500/10 flex items-center justify-center">
               <Mail className="w-6 h-6 text-red-500" />
@@ -95,7 +101,7 @@ export function Integrations() {
                 <button onClick={() => handleDisconnect('gmail')} className="text-sm text-danger hover:underline">Disconnect</button>
               </div>
             ) : (
-              <button onClick={handleGmailConnect} disabled={connecting === 'gmail'} className="bg-white text-black px-4 py-2 rounded-lg font-medium hover:bg-gray-200 flex items-center gap-2">
+              <button onClick={handleGmailConnect} disabled={connecting === 'gmail'} className="bg-background text-white px-4 py-2 rounded-lg font-medium hover:bg-panelHover flex items-center gap-2">
                 {connecting === 'gmail' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Connect Gmail
               </button>
             )}
@@ -103,7 +109,7 @@ export function Integrations() {
         </div>
 
         {/* HubSpot Integration Card */}
-        <div className="bg-panel border border-border rounded-xl p-6 flex flex-col gap-4">
+        <div className="bg-background border border-border rounded-xl p-6 flex flex-col gap-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <div className="w-12 h-12 rounded-lg bg-orange-500/10 flex items-center justify-center">

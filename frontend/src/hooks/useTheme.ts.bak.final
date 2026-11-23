@@ -1,0 +1,43 @@
+import { useEffect, useState } from 'react'
+
+export type Theme = 'light' | 'dark' | 'system'
+
+const KEY = 'nexora-theme'
+
+function getStored(): Theme {
+  const v = localStorage.getItem(KEY)
+  return v === 'light' || v === 'dark' || v === 'system' ? v : 'system'
+}
+
+function systemPrefersDark(): boolean {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches
+}
+
+function applyTheme(theme: Theme) {
+  const isDark = theme === 'dark' || (theme === 'system' && systemPrefersDark())
+  document.documentElement.classList.toggle('dark', isDark)
+}
+
+export function useTheme() {
+  const [theme, setThemeState] = useState<Theme>(() => getStored())
+
+  function setTheme(next: Theme) {
+    localStorage.setItem(KEY, next)
+    setThemeState(next)
+    applyTheme(next)
+  }
+
+  useEffect(() => {
+    applyTheme(theme)
+    if (theme !== 'system') return
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    const handler = () => applyTheme('system')
+    mq.addEventListener('change', handler)
+    return () => mq.removeEventListener('change', handler)
+  }, [theme])
+
+  const resolvedTheme: 'light' | 'dark' =
+    theme === 'system' ? (systemPrefersDark() ? 'dark' : 'light') : theme
+
+  return { theme, setTheme, resolvedTheme }
+}

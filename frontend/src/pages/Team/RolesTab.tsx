@@ -1,0 +1,150 @@
+import { useEffect, useState } from 'react'
+import { Shield, Check, X, AlertCircle } from 'lucide-react'
+import { listRoles, type TeamRole, ApiError, AuthError } from '../../services/teamApi'
+
+const KNOWN_PERMISSIONS: { key: string; label: string; group: string }[] = [
+  { key: 'view_dashboard', label: 'View dashboard', group: 'General' },
+  { key: 'manage_agents', label: 'Manage agents', group: 'AI' },
+  { key: 'create_workflows', label: 'Create workflows', group: 'AI' },
+  { key: 'run_workflows', label: 'Run workflows', group: 'AI' },
+  { key: 'approve_actions', label: 'Approve actions', group: 'Governance' },
+  { key: 'manage_integrations', label: 'Manage integrations', group: 'Governance' },
+  { key: 'manage_members', label: 'Manage members', group: 'Administration' },
+  { key: 'manage_billing', label: 'Manage billing', group: 'Administration' },
+  { key: 'view_audit', label: 'View audit log', group: 'Administration' },
+]
+
+export function RolesTab() {
+  const [roles, setRoles] = useState<TeamRole[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    listRoles()
+      .then((r) => { if (!cancelled) setRoles(r) })
+      .catch((e) => {
+        if (cancelled) return
+        if (e instanceof AuthError) { setError('Session expired. Please log in again.'); return }
+        if (e instanceof ApiError) { setError(`Failed to load roles: ${e.message}`); return }
+        setError('Failed to load roles.')
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  if (error) {
+    return (
+      <div className="bg-background border border-border rounded-xl p-8 text-center">
+        <AlertCircle className="w-12 h-12 text-danger mx-auto mb-4 opacity-70" />
+        <p className="text-danger text-sm">{error}</p>
+      </div>
+    )
+  }
+
+  if (roles === null) {
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {[0, 1, 2, 3, 4].map((i) => (
+          <div key={i} className="bg-background border border-border rounded-xl p-5 h-32 animate-pulse" />
+        ))}
+      </div>
+    )
+  }
+
+  // Matrix rows: only the permissions we have labels for. Unknown keys that
+  // the backend may include (e.g. config-shaped entries such as allowed_agents)
+  // are ignored so the matrix stays readable. To surface a new row, add it to
+  // KNOWN_PERMISSIONS above.
+  const allPermKeys = KNOWN_PERMISSIONS.map((p) => p.key)
+
+  return (
+    <div className="space-y-6">
+      {/* Role cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {roles.map((role) => {
+          const permCount = Object.values(role.permissions || {}).filter(Boolean).length
+          return (
+            <div key={role.id} className="bg-background border border-border rounded-xl p-5">
+              <div className="flex items-start justify-between mb-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center">
+                    <Shield className="w-4 h-4 text-accent" />
+                  </div>
+                  <div>
+                    <h3 className="text-white font-semibold text-sm capitalize">{role.name}</h3>
+                    <p className="text-xs text-muted">
+                      {role.is_system ? 'System role' : 'Custom role'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+              {role.description && (
+                <p className="text-xs text-muted mb-3 line-clamp-2">{role.description}</p>
+              )}
+              <div className="text-xs text-muted">
+                <span className="text-white font-medium">{permCount}</span> permissions granted
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Permission matrix */}
+      <div className="bg-background border border-border rounded-xl overflow-hidden">
+        <div className="p-5 border-b border-border">
+          <h3 className="text-white font-semibold text-sm">Permission Matrix</h3>
+          <p className="text-xs text-muted mt-1">
+            System roles are seeded and read-only. Custom roles will be editable in a later slice.
+          </p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border">
+                <th className="text-left px-5 py-3 text-xs font-semibold text-muted uppercase tracking-wider">
+                  Permission
+                </th>
+                {roles.map((r) => (
+                  <th
+                    key={r.id}
+                    className="text-center px-4 py-3 text-xs font-semibold text-muted uppercase tracking-wider capitalize"
+                  >
+                    {r.name}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {allPermKeys.map((permKey) => {
+                const known = KNOWN_PERMISSIONS.find((p) => p.key === permKey)
+                return (
+                  <tr key={permKey} className="border-b border-border last:border-b-0">
+                    <td className="px-5 py-3">
+                      <div className="text-white text-sm">{known?.label ?? permKey}</div>
+                      {known?.group && (
+                        <div className="text-[10px] text-muted uppercase tracking-wider mt-0.5">
+                          {known.group}
+                        </div>
+                      )}
+                    </td>
+                    {roles.map((r) => {
+                      const granted = Boolean((r.permissions || {})[permKey])
+                      return (
+                        <td key={r.id} className="text-center px-4 py-3">
+                          {granted ? (
+                            <Check className="w-4 h-4 text-success mx-auto" />
+                          ) : (
+                            <X className="w-4 h-4 text-muted/40 mx-auto" />
+                          )}
+                        </td>
+                      )
+                    })}
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  )
+}

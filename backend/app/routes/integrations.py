@@ -179,6 +179,8 @@ _GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
 ]
 
 
@@ -217,10 +219,15 @@ async def gmail_connect(
 
 @router.get("/gmail/callback")
 async def gmail_callback(
-    code: str = Query(..., description="Authorization code from Google"),
-    state: str = Query(..., description="CSRF state token"),
+    code: str = Query(None),
+    state: str = Query(None),
+    error: str = Query(None),
 ):
     """Handle Google's OAuth callback: exchange code for tokens, store them."""
+    if error:
+        return {"oauth_error": error}
+    if not code or not state:
+        return {"missing": True, "code": code, "state": state}
     _prune_states()
     entry = _PENDING_STATES.pop(state, None)
     if entry is None:

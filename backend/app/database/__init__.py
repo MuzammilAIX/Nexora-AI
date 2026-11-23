@@ -47,4 +47,7 @@ from .audit_models import AuditEvent  # noqa: F401,E402
 from .approval_models import Approval  # noqa: F401,E402
 from .auth_models import User, Tenant  # noqa: F401,E402
 from .integration_models import Integration, IntegrationCredential  # noqa: F401,E402
+from .document_models import Document  # noqa: F401,E402
 
+from .team_models import Role, Invitation  # noqa: F401,E402
+from .agent_models import Agent  # noqa: F401,E402

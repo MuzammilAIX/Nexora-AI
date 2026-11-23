@@ -1,0 +1,47 @@
+# ============================================================
+# Nexora AI - Docker Compose
+#   docker compose up -d        # start stack
+#   docker compose logs -f      # tail logs
+#   docker compose down         # stop stack (keeps DB volume)
+#   docker compose down -v      # stop AND wipe DB
+# ============================================================
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: nexora-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nexora_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexora_dev_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-nexora_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexora_user} -d ${POSTGRES_DB:-nexora_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nexora-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-nexora_user}:${POSTGRES_PASSWORD:-nexora_dev_pass}@db:5432/${POSTGRES_DB:-nexora_db}
+    ports:
+      - "8001:8001"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+
+volumes:
+  postgres-data:
+    driver: local

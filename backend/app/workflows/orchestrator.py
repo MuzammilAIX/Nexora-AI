@@ -1,3 +1,5 @@
+from app.agents.calendar import CalendarAgent
+from app.agents.bulk_email import BulkEmailAgent
 from typing import Any, Literal
 from typing_extensions import TypedDict
 
@@ -75,6 +77,36 @@ def _force_operations_agent(user_request: str) -> bool:
 def _force_analytics_agent(user_request: str) -> bool:
     """Deterministic analytics-intent detector. True = force an 'analytics' task."""
     return bool(ANALYTICS_PATTERNS.search(user_request or ""))
+
+
+BULK_EMAIL_PATTERNS = _re.compile(
+    r"\b(all\s+users|every\s+user|everyone|all\s+customers|all\s+contacts|"
+    r"bulk\s+email|broadcast|mass\s+email|mailing\s+list|"
+    r"every\s+recipient|all\s+recipients|notify\s+all)\b",
+    _re.IGNORECASE,
+)
+
+
+def _is_bulk_email_request(user_request: str) -> bool:
+    """Deterministic bulk-email-intent detector."""
+    return bool(BULK_EMAIL_PATTERNS.search(user_request or ""))
+
+
+EMAIL_REQUEST_PATTERNS = _re.compile(
+    r"\b(send|write|draft|compose)\s+(an?\s+)?(email|e-mail|mail)"
+    r"|\bemail\s+to\b"
+    r"|\bmail\s+to\b",
+    _re.IGNORECASE,
+)
+
+
+def _force_email_agent(user_request: str) -> bool:
+    """Deterministic email-intent detector (single-recipient email)."""
+    text = user_request or ""
+    # Skip if the request is bulk email — bulk override wins separately
+    if _is_bulk_email_request(text):
+        return False
+    return bool(EMAIL_REQUEST_PATTERNS.search(text))
 
 
 from ..database import SessionFactory
@@ -183,6 +215,8 @@ _AGENTS = {
     "support": SupportAgent(),
     "analytics": AnalyticsAgent(),
     "operations": OperationsAgent(),
+    "calendar": CalendarAgent(),
+    "bulk_email": BulkEmailAgent(),
 }
 
 
@@ -232,18 +266,32 @@ def create_plan(state: OrchestratorState) -> dict:
                 content=(
                     "You are Nexora AI's task planner. "
                     "Convert the supplied request analysis into "
-                    "an ordered, practical task plan. "
-                    "You may ONLY use these agent_type values: "
-                    "'research' (find companies, people, facts), "
-                    "'email' (draft email content), "
-                    "'reporting' (produce structured business reports), 'support' (handle customer support emails: classify issue, look up customer, draft response), 'analytics' (retrieve sales data, compute metrics, generate business reports), 'operations' (inventory, orders, customers), "
-                    "'review' (critique outputs of prior tasks for accuracy, "
-                    "missing info, and quality). "
-                    "If a task needs anything else, omit it or fold it into "
-                    "one of the two above. NEVER invent agent_type values. "
-                    "Set requires_approval=true for any task that sends "
-                    "emails or contacts external parties."
-                    "Do not claim that any task has been executed."
+                    "an ordered, practical task plan.\n\n"
+                    "VALID agent_type VALUES (choose exactly one per task):\n"
+                    "- 'calendar'  : read schedule / list events / propose meetings / schedule appointments. "
+                    "  ALSO use 'calendar' if the request mentions: schedule, meeting, calendar, appointment, "
+                    "  events, availability, free time, book, or when the user wants to meet with someone. "
+                    "- 'email'     : draft/send email content. Do NOT use for meeting scheduling "
+                    "  unless the user explicitly says 'email me' or 'send an email'.\n"
+                    "- 'research'  : find companies, people, facts on the open web.\n"
+                    "- 'reporting' : structured business reports.\n"
+                    "- 'support'   : customer support emails (classify, look up customer, draft response).\n"
+                    "- 'analytics' : query sales data, compute metrics, generate business reports.\n"
+                    "- 'operations': inventory, orders, customers.\n"
+                    "- 'lead'      : score leads, create CRM follow-up tasks.\n"
+                    "- 'review'    : critique prior task outputs for accuracy and quality.\n\n"
+                    "- 'bulk_email': send personalized emails to many recipients in one approval-gated campaign.\n"
+                    "ROUTING RULES (apply in order):\n"
+                    "1. If the request is about scheduling, meetings, calendar, or appointments → 'calendar'.\n"
+                    "2. If the request mentions 'with <person>' or 'with <email>' and implies a meeting → 'calendar', NOT 'email'.\n"
+                    "3. If the request is about reading/checking Gmail → 'support' or 'email', not 'calendar'.\n"
+                    "3b. If the request says 'all users' / 'everyone' / 'bulk email' / 'broadcast' → 'bulk_email', NOT 'email'.\n"
+                    "4. NEVER invent agent_type values; use only the list above.\n\n"
+                    "APPROVAL:\n"
+                    "Set requires_approval=true for any task that creates/modifies a calendar event, "
+                    "sends email, or contacts external parties. Read-only tasks (list events, search) "
+                    "do NOT require approval.\n\n"
+                    "Do not claim that any task has been executed — plan only."
                 )
             ),
             HumanMessage(content=str(state["analysis"])),
@@ -251,16 +299,16 @@ def create_plan(state: OrchestratorState) -> dict:
 
         tasks = [task.model_dump() for task in result.tasks]
 
-        # Deterministic override: if the user request is clearly CRM-related,
-        # rewrite the FIRST task to use the lead agent and gate it for approval.
-        # Rationale: the LLM planner keeps decomposing CRM work into
-        # research+reporting+email tasks instead of a single lead task.
         if _force_lead_agent(state.get("user_request", "")) and tasks:
             tasks[0]["agent_type"] = "lead"
             tasks[0]["requires_approval"] = True
             tasks[0]["approval_reason"] = (
                 "Lead tasks read+write CRM data; human approval is required."
             )
+
+        # Deterministic override: if the user request is clearly CRM-related,
+        # rewrite the FIRST task to use the lead agent and gate it for approval.
+        # Rationale: the LLM planner keeps decomposing CRM work into
 
         # Deterministic override: if the request is clearly support-related,
         # REPLACE the entire LLM plan with a single support task.
@@ -323,6 +371,30 @@ def create_plan(state: OrchestratorState) -> dict:
                 "approval_reason": None,
             }]
 
+        # research+reporting+email tasks instead of a single lead task.
+        # Deterministic override: single email requests route to email agent.
+        # Must come BEFORE bulk override so bulk wins for bulk requests.
+        if _force_email_agent(state.get("user_request", "")) and tasks:
+            tasks[0]["agent_type"] = "email"
+            tasks[0]["description"] = state.get("user_request", "")
+            tasks[0]["requires_approval"] = True
+            tasks[0]["approval_reason"] = (
+                "Email send: human approval required before delivery."
+            )
+
+        # Deterministic override: bulk email requests route to bulk_email.
+        # Rationale: the LLM misclassifies "send to all users" as operations/email.
+        # Must come BEFORE lead override so it wins for combined requests.
+        if _is_bulk_email_request(state.get("user_request", "")) and tasks:
+            tasks[0]["agent_type"] = "bulk_email"
+            tasks[0]["description"] = (
+                "Send personalized emails to every user in the tenant about: "
+                + state.get("user_request", "")
+            )
+            tasks[0]["requires_approval"] = True
+            tasks[0]["approval_reason"] = (
+                "Bulk email campaign: human approval required before sending."
+            )
         return {
             "tasks": tasks,
             "execution_notes": result.execution_notes,
@@ -393,7 +465,7 @@ async def execute_tasks(state: OrchestratorState) -> dict:
         # to compute the actual proposed action, then decide:
         #   - if the agent says requires_approval=True -> create approval
         #   - otherwise -> execute immediately
-        if agent_type in ("operations", "support") and not draft_only:
+        if agent_type in ("operations", "support", "calendar") and not draft_only:
             prep_agent = _AGENTS.get(agent_type)
             if prep_agent is not None:
                 dep_results = {
@@ -590,12 +662,32 @@ async def execute_tasks(state: OrchestratorState) -> dict:
                 continue
 
             prep_result = prep_output.result or {}
+
+            # Honor agent decision: if it needs more info OR explicitly says no
+            # approval needed, complete the task here and skip approval creation.
+            if prep_result.get("action") == "email_needs_input" or prep_result.get("requires_approval") is False:
+                results.append({
+                    "task_id": task_id,
+                    "agent_type": agent_type,
+                    "status": "done",
+                    "result": prep_result,
+                })
+                task_outputs[task_id] = prep_result
+                completed.add(task_id)
+                if run_id:
+                    bus.emit(run_id, "task_done", task_id=task_id, agent_type=agent_type, result=prep_result)
+                continue
+
             proposed_action = {
                 "agent_type": agent_type,
                 "task_description": task.get("description", ""),
                 "prepared_result": prep_result,
                 "action_kind": (
-                    "send_email" if agent_type == "support" else "execute_agent"
+                    prep_result.get("action_kind")
+                    or ("send_email" if agent_type == "support"
+                        else "calendar_create_event" if agent_type == "calendar"
+                        else "bulk_email_send" if agent_type == "bulk_email"
+                        else "execute_agent")
                 ),
                 "to": (prep_result.get("email") or {}).get("from"),
                 "thread_id": prep_result.get("thread_id"),

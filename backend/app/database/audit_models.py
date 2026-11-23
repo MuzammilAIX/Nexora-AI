@@ -1,8 +1,8 @@
-from datetime import datetime, timezone
+﻿from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import String, DateTime, ForeignKey, JSON
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy import String, DateTime, ForeignKey, JSON, Text
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from . import Base
@@ -30,20 +30,38 @@ class AuditEvent(Base):
         nullable=True,
         index=True,
     )
+    actor_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="user"
+    )
+    actor_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     event_type: Mapped[str] = mapped_column(
         String(64), nullable=False, index=True
     )
     subject_type: Mapped[str] = mapped_column(String(64), nullable=False, default="")
-    subject_id: Mapped[str] = mapped_column(String(128), nullable=False, default="", index=True)
-    run_id: Mapped[UUID | None] = mapped_column(
-        # NOT a ForeignKey: audit_events is append-only and must not be
-        # constrained by mutable operational tables (Section 9). Join by
-        # UUID at query time if referential integrity is needed.
-        PG_UUID(as_uuid=True),
-        nullable=True,
-        index=True,
+    subject_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="", index=True
     )
+    run_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
+    # Legacy text columns used by tools/audit.py raw INSERT path.
+    workflow_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    before_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    after_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    severity: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="info"
+    )
+    correlation_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
+    ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

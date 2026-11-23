@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Light theme (default) */
+:root {
+  --color-background: 248 250 252;
+  --color-panel: 255 255 255;
+  --color-panel-hover: 241 245 249;
+  --color-border: 226 232 240;
+  --color-accent: 139 92 246;
+  --color-accent-hover: 124 58 237;
+  --color-success: 16 185 129;
+  --color-warning: 245 158 11;
+  --color-danger: 239 68 68;
+  --color-muted: 100 116 139;
+  --text-strong: #0f172a;
+
+  /* Gray scale — tuned for LIGHT mode (dark text on light surfaces) */
+  --gray-50: 248 250 252;
+  --gray-100: 241 245 249;
+  --gray-200: 226 232 240;
+  --gray-300: 71 85 105;     /* slate-600: readable secondary text */
+  --gray-400: 100 116 139;   /* slate-500: readable muted text */
+  --gray-500: 148 163 184;   /* slate-400 */
+  --gray-600: 203 213 225;   /* slate-300 */
+  --gray-700: 226 232 240;   /* slate-200 */
+  --gray-800: 241 245 249;   /* slate-100 */
+  --gray-900: 248 250 252;   /* slate-50 */
+}
+
+/* Dark theme (your original palette) */
+.dark {
+  --color-background: 11 15 25;
+  --color-panel: 17 24 39;
+  --color-panel-hover: 26 35 50;
+  --color-border: 31 41 55;
+  --color-accent: 139 92 246;
+  --color-accent-hover: 124 58 237;
+  --color-success: 16 185 129;
+  --color-warning: 245 158 11;
+  --color-danger: 239 68 68;
+  --color-muted: 107 114 128;
+  --text-strong: #ffffff;
+
+  /* Gray scale — DARK mode (light text on dark surfaces) */
+  --gray-50: 249 250 251;
+  --gray-100: 243 244 246;
+  --gray-200: 229 231 235;
+  --gray-300: 209 213 219;   /* gray-300: readable secondary text */
+  --gray-400: 156 163 175;   /* gray-400: readable muted text */
+  --gray-500: 107 114 128;
+  --gray-600: 75 85 99;
+  --gray-700: 55 65 81;
+  --gray-800: 31 41 55;
+  --gray-900: 17 24 39;
+}
+
+@layer base {
+  body {
+    @apply bg-background font-sans antialiased;
+    color: rgb(var(--color-muted));
+  }
+  * {
+    @apply border-border;
+  }
+  .text-white { color: var(--text-strong); }
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgb(var(--color-border)); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--gray-600)); }
+
+.bg-dot-pattern {
+  background-color: rgb(var(--color-background));
+  background-image: radial-gradient(rgb(var(--color-border)) 1px, transparent 1px);
+  background-size: 20px 20px;
+}

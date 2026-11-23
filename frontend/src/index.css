@@ -2,37 +2,137 @@
 @tailwind components;
 @tailwind utilities;
 
+/* =========================================
+   LIGHT THEME (Clean SaaS)
+   ========================================= */
+:root {
+  --bg-main: #F5F7FB;
+  --bg-sidebar: #FFFFFF;
+  --bg-header: #FFFFFF;
+  --bg-card: #FFFFFF;
+  --bg-input: #FFFFFF;
+  --bg-hover: #F3EFFF;
+  --bg-active: #EEE8FF;
+
+  --text-primary: #172033;
+  --text-secondary: #64748B;
+  --text-muted: #8491A5;
+
+  --border: #E2E8F0;
+  --border-strong: #CBD5E1;
+
+  --accent: #7955E8;
+  --accent-hover: #6842D5;
+
+  --success: #059669;
+  --warning: #D97706;
+  --danger: #DC4545;
+
+  --card-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+
+/* =========================================
+   DARK THEME (Deep Enterprise Navy)
+   ========================================= */
+.dark {
+  --bg-main: #0B1020;
+  --bg-sidebar: #0F172A;
+  --bg-header: #0F172A;
+  --bg-card: #141E30;
+  --bg-input: #111A2B;
+  --bg-hover: #20243D;
+  --bg-active: #292345;
+
+  --text-primary: #F1F5F9;
+  --text-secondary: #A1AEC2;
+  --text-muted: #8190A7;
+
+  --border: #29364A;
+  --border-strong: #394961;
+
+  --accent: #9B7AFB;
+  --accent-hover: #B09AFF;
+
+  --success: #34D399;
+  --warning: #FBBF24;
+  --danger: #F87171;
+
+  --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);
+}
+
 @layer base {
   body {
-    @apply bg-background text-gray-300 font-sans antialiased;
+    background-color: var(--bg-main);
+    color: var(--text-primary);
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    transition: background-color 180ms ease, color 180ms ease;
   }
   * {
-    @apply border-border;
+    border-color: var(--border);
+  }
+  h1, h2, h3, h4, strong {
+    color: var(--text-primary) !important;
+  }
+  p, .description {
+    color: var(--text-secondary);
   }
 }
 
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+/* =========================================
+   FORCE INPUTS & TABLES
+   ========================================= */
+input, select, textarea {
+  background-color: var(--bg-input) !important;
+  color: var(--text-primary) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  transition: border-color 160ms ease;
 }
-::-webkit-scrollbar-track {
-  background: transparent;
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent) !important;
+  outline: none !important;
+  box-shadow: 0 0 0 2px rgba(121, 85, 232, 0.2) !important;
 }
-::-webkit-scrollbar-thumb {
-  background: #374151;
-  border-radius: 4px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #4B5563;
-}
-.bg-dot-pattern {
-  background-color: #0B0F19;
-  background-image: radial-gradient(#1F2937 1px, transparent 1px);
-  background-size: 20px 20px;
+input::placeholder {
+  color: var(--text-muted) !important;
 }
 
+table { width: 100%; border-collapse: collapse; }
+th {
+  color: var(--text-secondary) !important;
+  border-bottom: 1px solid var(--border) !important;
+  font-weight: 500;
+  text-align: left;
+}
+td {
+  color: var(--text-primary) !important;
+  border-bottom: 1px solid var(--border) !important;
+}
+tr:hover td {
+  background-color: var(--bg-hover) !important;
+}
+
+/* Sidebar & Header */
+aside { background-color: var(--bg-sidebar) !important; border-right: 1px solid var(--border) !important; }
+header { background-color: var(--bg-header) !important; border-bottom: 1px solid var(--border) !important; }
+
+/* Cards */
+.card, .bg-panel {
+  background-color: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  box-shadow: var(--card-shadow) !important;
+  border-radius: 12px !important;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+
+/* Background Pattern */
 .bg-dot-pattern {
-  background-color: #0B0F19;
-  background-image: radial-gradient(#1F2937 1px, transparent 1px);
+  background-color: var(--bg-main);
+  background-image: radial-gradient(var(--border) 1px, transparent 1px);
   background-size: 20px 20px;
 }

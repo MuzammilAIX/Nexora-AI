@@ -1,0 +1,265 @@
+import { useState, useEffect } from 'react'
+import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
+import { LayoutDashboard,
+  ShieldAlert,
+  Bot,
+  DollarSign,
+  GitBranch,
+  ListChecks,
+  Plug,
+  FileText,
+  Settings,
+  Bell,
+  Search,
+  Activity as ActivityIcon, CheckCheck, ListTodo, BookOpen, BarChart3, Users } from 'lucide-react'
+import { RunsAreaChart, StatusDonutChart } from './components/DashboardCharts'
+import { Login } from './components/Login'
+import { Overview } from './pages/Overview'
+import { MissionControl } from './pages/MissionControl'
+import { Approvals } from './pages/Approvals'
+import { Tasks } from './pages/Tasks'
+import { CRM } from './pages/CRM'
+import { Assistant } from './pages/Assistant'
+import { Workflows } from './pages/Workflows'
+import { Executions } from './pages/Executions'
+import { Integrations } from './pages/Integrations'
+import { Activity } from './pages/Activity'
+import { KnowledgeBase } from './pages/KnowledgeBase'
+import { Analytics } from './pages/Analytics'
+import { Agents } from './pages/Agents'
+import { Settings as SettingsPage } from './pages/Settings'
+import { useNotifications, type Notification } from './hooks/useNotifications'
+import { ThemeToggle } from './components/ThemeToggle'
+import { NotificationDropdown } from './components/NotificationDropdown'
+import { Team } from './pages/Team'
+
+const navGroups = [
+  {
+    label: 'Workspace',
+    items: [
+      { to: '/', label: 'Overview', icon: LayoutDashboard },
+      { to: '/assistant', label: 'AI Assistant', icon: Bot },
+      { to: '/workflows', label: 'Workflows', icon: GitBranch },
+      { to: '/crm', label: 'Sales Pipeline', icon: DollarSign },
+    ],
+  },
+  {
+    label: 'AI Management',
+    items: [
+      { to: '/agents', label: 'Agent Management', icon: Bot },
+      { to: '/tasks', label: 'Tasks', icon: ListTodo },
+      { to: '/mission-control', label: 'Mission Control', icon: ShieldAlert },
+      { to: '/approvals', label: 'Approvals', icon: CheckCheck },
+      { to: '/executions', label: 'Executions', icon: ListChecks },
+    ],
+  },
+  {
+    label: 'Business & Data',
+    items: [
+      { to: '/integrations', label: 'Integrations', icon: Plug },
+      { to: '/knowledge', label: 'Knowledge Base', icon: BookOpen },
+      { to: '/analytics', label: 'Analytics', icon: BarChart3 },
+      { to: '/activity', label: 'Activity', icon: FileText },
+    ],
+  },
+  {
+    label: 'Administration',
+    items: [
+      { to: '/team', label: 'Team & Permissions', icon: Users },
+      { to: '/settings', label: 'Settings', icon: Settings },
+    ],
+  },
+]
+
+function Sidebar({ me }: { me: Me | null }) {
+  return (
+    <aside className="w-64 h-screen bg-panel border-r border-border flex flex-col fixed left-0 top-0">
+      <div className="p-6 border-b border-border">
+        <h1 className="text-xl font-bold text-white tracking-tight">
+          Nexora <span className="text-accent">AI</span>
+        </h1>
+        <p className="text-xs text-muted mt-1">Command Center</p>
+      </div>
+      <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
+        {navGroups.map((group) => (
+          <div key={group.label} className="mb-4">
+            <div className="px-3 py-1.5 text-[10px] font-semibold text-muted uppercase tracking-wider">
+              {group.label}
+            </div>
+            <div className="space-y-1">
+              {group.items.map((item) => (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  end={item.to === '/'}
+                  className={({ isActive }) =>
+                    'flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ' +
+                    (isActive ? 'bg-accent/10 text-accent border border-accent/20' : 'text-gray-400 hover:text-white hover:bg-panelHover')
+                  }
+                >
+                  <item.icon className="w-4 h-4" />
+                  {item.label}
+                </NavLink>
+              ))}
+            </div>
+          </div>
+        ))}
+      </nav>
+      <div className="p-4 border-t border-border">
+        <div className="flex items-center gap-3 px-3 py-2">
+          <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center text-white text-xs font-bold">{me?.email ? me.email[0].toUpperCase() : "U"}</div>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium text-white truncate">{me?.email ? me.email.split("@")[0] : "User"}</p>
+            <p className="text-xs text-muted truncate">{me?.email || ""}</p>
+          </div>
+          <button
+            onClick={() => { localStorage.removeItem('nexora_token'); window.location.reload(); }}
+            className="text-xs text-muted hover:text-danger transition-colors"
+          >
+            Out
+          </button>
+        </div>
+      </div>
+    </aside>
+  )
+}
+
+function Topbar({ me, notificationCount, onBellClick, notifications, notifOpen, setNotifOpen }: {
+  me: Me | null
+  notificationCount: number
+  onBellClick: () => void
+  notifications: Notification[]
+  notifOpen: boolean
+  setNotifOpen: (v: boolean) => void
+}) {
+  return (
+    <header className="h-16 bg-panel border-b border-border flex items-center justify-between px-6 sticky top-0 z-10">
+      <div className="flex items-center gap-4 flex-1">
+        <div className="relative w-96 max-w-full">
+          <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
+          <input
+            type="text"
+            placeholder="Search anything..."
+            className="w-full bg-background border border-border rounded-lg pl-10 pr-4 py-2 text-sm text-white placeholder:text-muted focus:outline-none focus:border-accent/50"
+          />
+        </div>
+      </div>
+      <div className="relative flex items-center gap-3">
+        <ThemeToggle />
+        <button
+          onClick={onBellClick}
+          className="relative p-2 rounded-lg hover:bg-panelHover text-gray-400 hover:text-white transition-colors"
+        >
+          <Bell className="w-5 h-5" />
+          {notificationCount > 0 && (
+            <span className="absolute top-1 right-1 min-w-[16px] h-4 px-1 rounded-full bg-danger text-white text-[10px] font-bold flex items-center justify-center">
+              {notificationCount > 99 ? "99+" : notificationCount}
+            </span>
+          )}
+        </button>
+        <NotificationDropdown items={notifications} open={notifOpen} onClose={() => setNotifOpen(false)} />
+      </div>
+    </header>
+  )
+}
+
+function Placeholder({ title, subtitle }: { title: string; subtitle: string }) {
+  return (
+    <div className="p-8">
+      <h2 className="text-2xl font-bold text-white mb-1">{title}</h2>
+      <p className="text-sm text-muted mb-6">{subtitle}</p>
+      <div className="bg-panel border border-border rounded-xl p-8 text-center">
+        <ActivityIcon className="w-12 h-12 text-muted mx-auto mb-4 opacity-50" />
+        <p className="text-muted text-sm">Coming in the next slice.</p>
+      </div>
+    </div>
+  )
+}
+
+interface Me {
+  id: string
+  email: string
+  role: string
+  tenant_id: string
+  tenant_name?: string
+}
+
+function App() {
+  const [authed, setAuthed] = useState<boolean | null>(null)
+  const [me, setMe] = useState<Me | null>(null)
+  const [notifOpen, setNotifOpen] = useState(false)
+  const { items: notifications } = useNotifications()
+
+  useEffect(() => {
+    const token = localStorage.getItem('nexora_token')
+    if (!token) { setAuthed(false); return }
+    // Check JWT expiry without verifying signature (client-side only; backend still validates)
+    try {
+      const payload = JSON.parse(atob(token.split('.')[1]))
+      const nowSec = Math.floor(Date.now() / 1000)
+      if (payload.exp && payload.exp < nowSec) {
+        localStorage.removeItem('nexora_token')
+        setAuthed(false)
+        return
+      }
+      setAuthed(true)
+    } catch {
+      // Malformed token - treat as unauthenticated
+      localStorage.removeItem('nexora_token')
+      setAuthed(false)
+    }
+  }, [])
+
+  // Fetch current user whenever authed becomes true
+  useEffect(() => {
+    if (!authed) { setMe(null); return }
+    const token = localStorage.getItem('nexora_token')
+    if (!token) return
+    fetch('/api/v1/auth/me', { headers: { Authorization: 'Bearer ' + token } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data) setMe(data) })
+      .catch(() => {})
+  }, [authed])
+
+  if (authed === null) return <div className="min-h-screen bg-background" />
+  if (!authed) return <Login />
+
+  return (
+    <BrowserRouter>
+      <div className="min-h-screen bg-background">
+        <Sidebar me={me} />
+        <div className="ml-64">
+          <Topbar
+            me={me}
+            notificationCount={notifications.length}
+            onBellClick={() => setNotifOpen(o => !o)}
+            notifications={notifications}
+            notifOpen={notifOpen}
+            setNotifOpen={setNotifOpen}
+          />
+          <main>
+            <Routes>
+              <Route path="/" element={<Overview />} />
+              <Route path="/agents" element={<Agents />} />
+              <Route path="/mission-control" element={<MissionControl />} />
+              <Route path="/approvals" element={<Approvals />} />
+              <Route path="/tasks" element={<Tasks />} />
+              <Route path="/crm" element={<CRM />} />
+              <Route path="/assistant" element={<Assistant />} />
+              <Route path="/workflows" element={<Workflows />} />
+              <Route path="/executions" element={<Executions />} />
+              <Route path="/integrations" element={<Integrations />} />
+              <Route path="/knowledge" element={<KnowledgeBase />} />
+              <Route path="/analytics" element={<Analytics />} />
+              <Route path="/activity" element={<Activity />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/team" element={<Team />} />
+            </Routes>
+          </main>
+        </div>
+      </div>
+    </BrowserRouter>
+  )
+}
+
+export default App

@@ -45,6 +45,7 @@ class Approval(Base):
     decided_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    decided_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     execution_result: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
     created_at: Mapped[datetime] = mapped_column(

@@ -1,0 +1,436 @@
+import { useState, useEffect, useMemo } from 'react'
+import {
+  LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
+} from 'recharts'
+import {
+  TrendingUp, TrendingDown, DollarSign, ShoppingCart, Users,
+  Bot, Clock, CheckCircle2, XCircle, Activity, FileText, Zap
+} from 'lucide-react'
+
+interface BusinessData {
+  current_month_revenue: number
+  prev_month_revenue: number
+  revenue_change_pct: number
+  current_month_orders: number
+  prev_month_orders: number
+  avg_order_value: number
+  total_customers: number
+  revenue_trend: { date: string; revenue: number; orders: number }[]
+  top_products: { name: string; category: string; revenue: number; units: number }[]
+}
+
+interface AIData {
+  total_runs: number
+  completed: number
+  failed: number
+  pending_approval: number
+  success_rate: number
+  avg_duration_s: number
+  agent_usage: { agent: string; tasks: number }[]
+  pending_approvals: number
+  approved_approvals: number
+  rejected_approvals: number
+}
+
+interface WorkflowData {
+  daily_runs: { date: string; total: number; completed: number; failed: number; pending: number }[]
+  runs_with_retries: number
+  max_retries: number
+  total_retries: number
+  hourly_pattern: { hour: number; count: number }[]
+}
+
+interface OperationalData {
+  approval_rate: number
+  total_approvals: number
+  approved: number
+  rejected: number
+  pending_approvals: number
+  completed_runs: number
+  time_saved_minutes: number
+  human_intervention_rate: number
+  recent_events: { event_type: string; subject_type: string; subject_id: string; created_at: string }[]
+  documents_count: number
+  documents_total_bytes: number
+}
+
+const COLORS = {
+  purple: '#8B5CF6',
+  green: '#10B981',
+  red: '#EF4444',
+  amber: '#F59E0B',
+  blue: '#3B82F6',
+  cyan: '#06B6D4',
+}
+
+const AGENT_COLORS = ['#8B5CF6', '#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#06B6D4', '#EC4899', '#F97316']
+
+function formatCurrency(n: number): string {
+  if (n >= 1_000_000) return '$' + (n / 1_000_000).toFixed(1) + 'M'
+  if (n >= 1_000) return '$' + (n / 1_000).toFixed(1) + 'K'
+  return '$' + n.toFixed(0)
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return seconds.toFixed(1) + 's'
+  if (seconds < 3600) return (seconds / 60).toFixed(1) + 'm'
+  return (seconds / 3600).toFixed(1) + 'h'
+}
+
+function relativeTime(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime()
+  if (ms < 60000) return 'just now'
+  const min = Math.floor(ms / 60000)
+  if (min < 60) return min + 'm ago'
+  const h = Math.floor(min / 60)
+  if (h < 24) return h + 'h ago'
+  return Math.floor(h / 24) + 'd ago'
+}
+function KpiCard({ label, value, change, icon: Icon, color }: any) {
+  const isPositive = change > 0
+  return (
+    <div className="bg-panel border border-border rounded-xl p-4">
+      <div className="flex items-start justify-between mb-2">
+        <p className="text-xs text-muted">{label}</p>
+        <Icon className={`w-4 h-4 ${color || 'text-accent'}`} />
+      </div>
+      <p className="text-2xl font-bold text-white">{value}</p>
+      {change !== undefined && change !== 0 && (
+        <p className={`text-xs mt-1 flex items-center gap-1 ${isPositive ? 'text-success' : 'text-danger'}`}>
+          {isPositive ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+          {Math.abs(change).toFixed(1)}% vs last month
+        </p>
+      )}
+    </div>
+  )
+}
+
+function BusinessTab() {
+  const [data, setData] = useState<BusinessData | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    fetch('/api/v1/analytics/business', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('nexora_token') },
+    })
+      .then(r => r.json())
+      .then(setData)
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return <div className="text-center text-muted py-12">Loading business analytics...</div>
+  if (!data) return <div className="text-center text-danger py-12">Failed to load</div>
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-4 gap-4">
+        <KpiCard label="Revenue (MTD)" value={formatCurrency(data.current_month_revenue)} change={data.revenue_change_pct} icon={DollarSign} color="text-success" />
+        <KpiCard label="Orders (MTD)" value={data.current_month_orders} change={data.prev_month_orders > 0 ? ((data.current_month_orders - data.prev_month_orders) / data.prev_month_orders * 100) : 0} icon={ShoppingCart} color="text-accent" />
+        <KpiCard label="Avg Order Value" value={formatCurrency(data.avg_order_value)} icon={TrendingUp} color="text-purple-400" />
+        <KpiCard label="Total Customers" value={data.total_customers} icon={Users} color="text-blue-400" />
+      </div>
+
+      <div className="bg-panel border border-border rounded-xl p-6">
+        <h3 className="text-sm font-semibold text-white mb-4">Revenue Trend (Last 30 Days)</h3>
+        <ResponsiveContainer width="100%" height={280}>
+          <LineChart data={data.revenue_trend}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1F2937" />
+            <XAxis dataKey="date" stroke="#6B7280" style={{ fontSize: '11px' }} tickFormatter={(v) => v.slice(5)} />
+            <YAxis stroke="#6B7280" style={{ fontSize: '11px' }} tickFormatter={formatCurrency} />
+            <Tooltip
+              contentStyle={{ backgroundColor: '#151D2C', border: '1px solid #1F2937', borderRadius: '8px' }}
+              labelStyle={{ color: '#F8FAFC' }}
+              formatter={(value: any, name: string) => name === 'revenue' ? formatCurrency(value) : value}
+            />
+            <Line type="monotone" dataKey="revenue" stroke={COLORS.purple} strokeWidth={2} dot={{ fill: COLORS.purple, r: 3 }} activeDot={{ r: 5 }} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="bg-panel border border-border rounded-xl p-6">
+        <h3 className="text-sm font-semibold text-white mb-4">Top 5 Products by Revenue</h3>
+        <div className="space-y-3">
+          {data.top_products.map((p, i) => {
+            const maxRev = data.top_products[0]?.revenue || 1
+            const pct = (p.revenue / maxRev) * 100
+            return (
+              <div key={p.name} className="flex items-center gap-3">
+                <span className="text-xs text-muted font-mono w-6">{i + 1}.</span>
+                <div className="flex-1">
+                  <div className="flex justify-between text-sm mb-1">
+                    <span className="text-white">{p.name}</span>
+                    <span className="text-success font-mono">{formatCurrency(p.revenue)}</span>
+                  </div>
+                  <div className="h-1.5 bg-border rounded-full overflow-hidden">
+                    <div className="h-full bg-accent rounded-full" style={{ width: pct + '%' }} />
+                  </div>
+                  <div className="flex justify-between text-[10px] text-muted mt-1">
+                    <span className="capitalize">{p.category}</span>
+                    <span>{p.units} units</span>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+function AITab() {
+  const [data, setData] = useState<AIData | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    fetch('/api/v1/analytics/ai', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('nexora_token') },
+    })
+      .then(r => r.json())
+      .then(setData)
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return <div className="text-center text-muted py-12">Loading AI analytics...</div>
+  if (!data) return <div className="text-center text-danger py-12">Failed to load</div>
+
+  const approvalData = [
+    { name: 'Approved', value: data.approved_approvals, color: COLORS.green },
+    { name: 'Rejected', value: data.rejected_approvals, color: COLORS.red },
+    { name: 'Pending', value: data.pending_approvals, color: COLORS.amber },
+  ].filter(d => d.value > 0)
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-4 gap-4">
+        <KpiCard label="Total Runs" value={data.total_runs} icon={Activity} color="text-accent" />
+        <KpiCard label="Success Rate" value={data.success_rate + '%'} icon={CheckCircle2} color="text-success" />
+        <KpiCard label="Avg Duration" value={formatDuration(data.avg_duration_s)} icon={Clock} color="text-purple-400" />
+        <KpiCard label="Pending Approvals" value={data.pending_approvals} icon={Clock} color="text-warning" />
+      </div>
+
+      <div className="grid grid-cols-2 gap-6">
+        <div className="bg-panel border border-border rounded-xl p-6">
+          <h3 className="text-sm font-semibold text-white mb-4">Agent Usage (Task Count)</h3>
+          <ResponsiveContainer width="100%" height={280}>
+            <BarChart data={data.agent_usage} layout="vertical">
+              <CartesianGrid strokeDasharray="3 3" stroke="#1F2937" />
+              <XAxis type="number" stroke="#6B7280" style={{ fontSize: '11px' }} />
+              <YAxis type="category" dataKey="agent" stroke="#6B7280" style={{ fontSize: '11px' }} width={80} />
+              <Tooltip contentStyle={{ backgroundColor: '#151D2C', border: '1px solid #1F2937', borderRadius: '8px' }} />
+              <Bar dataKey="tasks" radius={[0, 4, 4, 0]}>
+                {data.agent_usage.map((_, i) => (
+                  <Cell key={i} fill={AGENT_COLORS[i % AGENT_COLORS.length]} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-panel border border-border rounded-xl p-6">
+          <h3 className="text-sm font-semibold text-white mb-4">Approval Status Distribution</h3>
+          <ResponsiveContainer width="100%" height={280}>
+            <PieChart>
+              <Pie data={approvalData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={90} label={(e: any) => e.name + ': ' + e.value}>
+                {approvalData.map((entry, i) => <Cell key={i} fill={entry.color} />)}
+              </Pie>
+              <Tooltip contentStyle={{ backgroundColor: '#151D2C', border: '1px solid #1F2937', borderRadius: '8px' }} />
+              <Legend wrapperStyle={{ fontSize: '12px', color: '#9CA3AF' }} />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-4">
+        <div className="bg-panel border border-border rounded-xl p-4">
+          <p className="text-xs text-muted mb-1">Completed Runs</p>
+          <p className="text-xl font-bold text-success">{data.completed}</p>
+        </div>
+        <div className="bg-panel border border-border rounded-xl p-4">
+          <p className="text-xs text-muted mb-1">Failed Runs</p>
+          <p className="text-xl font-bold text-danger">{data.failed}</p>
+        </div>
+        <div className="bg-panel border border-border rounded-xl p-4">
+          <p className="text-xs text-muted mb-1">Awaiting Approval</p>
+          <p className="text-xl font-bold text-warning">{data.pending_approval}</p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function WorkflowsTab() {
+  const [data, setData] = useState<WorkflowData | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    fetch('/api/v1/analytics/workflows', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('nexora_token') },
+    })
+      .then(r => r.json())
+      .then(setData)
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return <div className="text-center text-muted py-12">Loading workflow analytics...</div>
+  if (!data) return <div className="text-center text-danger py-12">Failed to load</div>
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-panel border border-border rounded-xl p-6">
+        <h3 className="text-sm font-semibold text-white mb-4">Daily Runs (Last 14 Days)</h3>
+        <ResponsiveContainer width="100%" height={300}>
+          <BarChart data={data.daily_runs}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1F2937" />
+            <XAxis dataKey="date" stroke="#6B7280" style={{ fontSize: '11px' }} tickFormatter={(v) => v.slice(5)} />
+            <YAxis stroke="#6B7280" style={{ fontSize: '11px' }} />
+            <Tooltip contentStyle={{ backgroundColor: '#151D2C', border: '1px solid #1F2937', borderRadius: '8px' }} />
+            <Legend wrapperStyle={{ fontSize: '12px' }} />
+            <Bar dataKey="completed" stackId="a" fill={COLORS.green} radius={[0, 0, 0, 0]} name="Completed" />
+            <Bar dataKey="failed" stackId="a" fill={COLORS.red} name="Failed" />
+            <Bar dataKey="pending" stackId="a" fill={COLORS.amber} radius={[4, 4, 0, 0]} name="Pending" />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="grid grid-cols-3 gap-4">
+        <div className="bg-panel border border-border rounded-xl p-4">
+          <p className="text-xs text-muted mb-1">Runs With Retries</p>
+          <p className="text-xl font-bold text-white">{data.runs_with_retries}</p>
+        </div>
+        <div className="bg-panel border border-border rounded-xl p-4">
+          <p className="text-xs text-muted mb-1">Max Retries</p>
+          <p className="text-xl font-bold text-warning">{data.max_retries}</p>
+        </div>
+        <div className="bg-panel border border-border rounded-xl p-4">
+          <p className="text-xs text-muted mb-1">Total Retries</p>
+          <p className="text-xl font-bold text-white">{data.total_retries}</p>
+        </div>
+      </div>
+
+      <div className="bg-panel border border-border rounded-xl p-6">
+        <h3 className="text-sm font-semibold text-white mb-4">Activity by Hour</h3>
+        <ResponsiveContainer width="100%" height={200}>
+          <BarChart data={data.hourly_pattern}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1F2937" />
+            <XAxis dataKey="hour" stroke="#6B7280" style={{ fontSize: '11px' }} tickFormatter={(v) => v + ':00'} />
+            <YAxis stroke="#6B7280" style={{ fontSize: '11px' }} />
+            <Tooltip contentStyle={{ backgroundColor: '#151D2C', border: '1px solid #1F2937', borderRadius: '8px' }} />
+            <Bar dataKey="count" fill={COLORS.purple} radius={[4, 4, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  )
+}
+function OperationalTab() {
+  const [data, setData] = useState<OperationalData | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    fetch('/api/v1/analytics/operational', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('nexora_token') },
+    })
+      .then(r => r.json())
+      .then(setData)
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return <div className="text-center text-muted py-12">Loading operational analytics...</div>
+  if (!data) return <div className="text-center text-danger py-12">Failed to load</div>
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-4 gap-4">
+        <KpiCard label="Time Saved" value={data.time_saved_minutes + ' min'} icon={Zap} color="text-success" />
+        <KpiCard label="Approval Rate" value={data.approval_rate + '%'} icon={CheckCircle2} color="text-accent" />
+        <KpiCard label="Human Interventions" value={data.total_approvals} icon={Users} color="text-purple-400" />
+        <KpiCard label="Completed Runs" value={data.completed_runs} icon={Activity} color="text-success" />
+      </div>
+
+      <div className="grid grid-cols-2 gap-6">
+        <div className="bg-panel border border-border rounded-xl p-6">
+          <h3 className="text-sm font-semibold text-white mb-4">Approval Breakdown</h3>
+          <div className="space-y-3">
+            {[
+              { label: 'Approved', value: data.approved, color: 'text-success' },
+              { label: 'Rejected', value: data.rejected, color: 'text-danger' },
+              { label: 'Pending', value: data.pending_approvals, color: 'text-warning' },
+            ].map((item) => (
+              <div key={item.label} className="flex justify-between items-center">
+                <span className="text-sm text-muted">{item.label}</span>
+                <span className={`text-lg font-bold ${item.color}`}>{item.value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-panel border border-border rounded-xl p-6">
+          <h3 className="text-sm font-semibold text-white mb-4">Knowledge Base</h3>
+          <div className="space-y-3">
+            <div className="flex justify-between">
+              <span className="text-sm text-muted">Documents</span>
+              <span className="text-lg font-bold text-white">{data.documents_count}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-sm text-muted">Storage Used</span>
+              <span className="text-lg font-bold text-white">{(data.documents_total_bytes / 1024).toFixed(0)} KB</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-panel border border-border rounded-xl p-6">
+        <h3 className="text-sm font-semibold text-white mb-4">Recent Activity</h3>
+        <div className="space-y-2">
+          {data.recent_events.map((evt, i) => (
+            <div key={i} className="flex items-center gap-3 py-2 border-b border-border last:border-b-0">
+              <FileText className="w-4 h-4 text-muted shrink-0" />
+              <span className="text-sm text-white flex-1 truncate">{evt.event_type}</span>
+              <span className="text-xs text-muted font-mono">{evt.subject_type}</span>
+              <span className="text-xs text-muted">{relativeTime(evt.created_at)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+type Tab = 'business' | 'ai' | 'workflows' | 'operational'
+
+export function Analytics() {
+  const [tab, setTab] = useState<Tab>('business')
+
+  return (
+    <div className="p-8 max-w-7xl mx-auto">
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold text-white mb-1">Analytics & Reports</h1>
+        <p className="text-sm text-muted">Business metrics, AI activity, workflow health, and operational KPIs</p>
+      </div>
+
+      <div className="bg-panel border border-border rounded-xl p-2 mb-6 inline-flex gap-1">
+        {([
+          { key: 'business', label: 'Business' },
+          { key: 'ai', label: 'AI Agents' },
+          { key: 'workflows', label: 'Workflows' },
+          { key: 'operational', label: 'Operational' },
+        ] as const).map((t) => (
+          <button key={t.key} onClick={() => setTab(t.key)}
+            className={'px-4 py-2 rounded-lg text-sm font-medium transition-colors ' + (tab === t.key ? 'bg-accent text-white' : 'text-muted hover:bg-panelHover')}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'business' && <BusinessTab />}
+      {tab === 'ai' && <AITab />}
+      {tab === 'workflows' && <WorkflowsTab />}
+      {tab === 'operational' && <OperationalTab />}
+    </div>
+  )
+}

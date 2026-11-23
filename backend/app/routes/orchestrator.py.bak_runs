@@ -1,0 +1,304 @@
+import asyncio
+import json
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..workflows.orchestrator import run_orchestrator
+from ..services.event_bus import bus
+from ..database import get_session, SessionFactory
+from ..database.auth_models import User
+from ..auth_deps import get_current_user
+from ..services.run_store import (
+    create_run,
+    complete_run,
+    get_run,
+    list_runs,
+)
+
+
+router = APIRouter(
+    prefix="/orchestrator",
+    tags=["Orchestrator"],
+)
+
+
+class OrchestratorRequest(BaseModel):
+    user_request: str = Field(
+        min_length=1,
+        max_length=10000,
+        description="Business instruction for Nexora AI",
+    )
+
+
+# ── Non-streaming endpoint (saves to DB) ─────────────────────────
+
+@router.post("/run")
+async def execute_orchestrator(
+    request: OrchestratorRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    db_run = await create_run(
+        session, request.user_request, user.tenant_id, user.id
+    )
+
+    try:
+        result = await run_orchestrator(
+            request.user_request,
+            run_id=str(db_run.id),
+            tenant_id=str(user.tenant_id),
+        )
+        result["run_id"] = str(db_run.id)
+        await complete_run(
+            session,
+            db_run.id,
+            result,
+            result.get("status", "unknown"),
+        )
+
+        if result.get("status") == "failed":
+            error_detail = (result.get("error") or "").strip() or "Orchestration failed: no error detail captured. Check the orchestrator logs and OpenAI API status."
+            raise HTTPException(
+                status_code=502,
+                detail=error_detail,
+            )
+
+        # pending_approval is a valid 200 — the run succeeded but is
+        # paused for human review. Only 'failed' is a 5xx.
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        import traceback, logging
+        logging.getLogger(__name__).error(
+            "orchestrator run failed: %s\n%s",
+            exc, traceback.format_exc(),
+        )
+        await complete_run(
+            session,
+            db_run.id,
+            {"error": str(exc)},
+            "failed",
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected orchestration error occurred.",
+        )
+
+
+# ── Streaming endpoint (SSE) ─────────────────────────────────────
+
+@router.post("/stream")
+async def execute_orchestrator_stream(
+    request: OrchestratorRequest,
+    user: User = Depends(get_current_user),
+):
+    run_id = bus.new_run()
+
+    async def event_stream():
+        async def do_run():
+            # New session — request-scoped session is closed once
+            # StreamingResponse begins.
+            async with SessionFactory() as db:
+                db_run = await create_run(
+                    db, request.user_request, user.tenant_id, user.id
+                )
+                try:
+                    state = await run_orchestrator(
+                        request.user_request,
+                        run_id=str(db_run.id),
+                        tenant_id=str(user.tenant_id),
+                    )
+                    status = state.get("status", "completed")
+                    await complete_run(db, db_run.id, state, status)
+                    bus.emit(
+                        run_id,
+                        "final",
+                        state=state,
+                        db_run_id=str(db_run.id),
+                    )
+                except Exception as exc:
+                    try:
+                        await complete_run(
+                            db, db_run.id, {"error": str(exc)}, "failed"
+                        )
+                    except Exception:
+                        pass
+                    bus.emit(run_id, "error", error=str(exc))
+                finally:
+                    bus.close(run_id)
+
+        runner = asyncio.create_task(do_run())
+
+        try:
+            while True:
+                event = await bus.next(run_id)
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+                if event.get("type") == "end":
+                    break
+        finally:
+            if not runner.done():
+                runner.cancel()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── History endpoints ────────────────────────────────────────────
+
+@router.get("/runs")
+async def get_runs(
+    limit: int = 20,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    runs = await list_runs(session, user.tenant_id, limit=limit)
+    return [
+        {
+            "id": str(r.id),
+            "user_request": r.user_request,
+            "status": r.status,
+            "created_at": r.created_at.isoformat(),
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+        }
+        for r in runs
+    ]
+
+
+@router.get("/runs/{run_id}")
+async def get_run_by_id(
+    run_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    from uuid import UUID
+    try:
+        uid = UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run id")
+
+    run = await get_run(session, uid, user.tenant_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    state = None
+    if run.state_json:
+        try:
+            state = json.loads(run.state_json)
+        except Exception:
+            state = None
+
+    return {
+        "id": str(run.id),
+        "user_request": run.user_request,
+        "status": run.status,
+        "created_at": run.created_at.isoformat(),
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "state": state,
+    }
+
+AGENT_DESCRIPTIONS = {
+    "operations": "Inspect inventory, query orders, and execute customer operations with approval.",
+    "lead":       "Score leads and create CRM follow-up tasks in HubSpot with human approval.",
+    "analytics":  "Query business metrics from PostgreSQL and surface actionable insights.",
+    "research":   "Research companies, people, and topics from the open web.",
+    "reporting":  "Compile reports and route them for management review before distribution.",
+    "email":      "Draft and send outbound emails via Gmail under the approval gate.",
+    "support":    "Search Gmail, classify tickets, and draft replies that send on approval.",
+    "review":     "Quality gate for agent output before it reaches a human decision-maker.",
+}
+
+@router.get("/agents")
+async def list_agents(
+    user: User = Depends(get_current_user),
+):
+    """Return the list of registered AI agents and their status."""
+    from ..workflows.orchestrator import _AGENTS
+    
+    # We simulate some metrics for now, but these can be wired to real DB counts later
+    agent_data = []
+    for name, agent in _AGENTS.items():
+        agent_data.append({
+            "id": name,
+            "name": name.capitalize() + " Agent",
+            "description": AGENT_DESCRIPTIONS.get(name, getattr(agent, "description", "Specialized AI agent")),
+            "status": "active", # We can add logic later to check if a tenant has it enabled
+            "model": "gpt-4o-mini",
+            "last_run": "Recently", 
+            "success_rate": None,
+            "total_runs": 42
+        })
+    return agent_data
+
+@router.get("/tasks")
+async def list_tasks(
+    status: str = "all",
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """Flatten every task from every run for this tenant into one list."""
+    from sqlalchemy import select, desc
+    from app.database.models import Run as RunModel
+
+    stmt = (
+        select(RunModel)
+        .where(RunModel.tenant_id == user.tenant_id)
+        .order_by(desc(RunModel.created_at))
+    )
+    runs = (await session.execute(stmt)).scalars().all()
+
+    out = []
+    for run in runs:
+        if not run.state_json:
+            continue
+        try:
+            state = json.loads(run.state_json)
+        except Exception:
+            continue
+
+        planned = state.get("tasks") or []
+        results = state.get("task_results") or []
+
+        for t in planned:
+            tid = t.get("task_id")
+            result = next((r for r in results if r.get("task_id") == tid), None)
+            task_status = (result or {}).get("status") or (
+                "pending_approval" if t.get("requires_approval") else "queued"
+            )
+
+            if status != "all" and task_status != status:
+                continue
+
+            out.append({
+                "task_id": f"{run.id}:{tid}",
+                "raw_task_id": tid,
+                "run_id": str(run.id),
+                "run_request": run.user_request,
+                "run_status": run.status,
+                "created_at": run.created_at.isoformat(),
+                "agent_type": t.get("agent_type"),
+                "description": t.get("description"),
+                "dependencies": t.get("dependencies") or [],
+                "requires_approval": bool(t.get("requires_approval")),
+                "approval_reason": t.get("approval_reason"),
+                "status": task_status,
+                "approval_id": (result or {}).get("approval_id"),
+                "reason": (result or {}).get("reason"),
+                "result": (result or {}).get("result"),
+            })
+
+    return out
+

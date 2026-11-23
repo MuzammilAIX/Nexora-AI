@@ -19,6 +19,10 @@ from app.routes.auth import router as auth_router
 from app.routes.approvals import router as approvals_router
 from app.routes.audit import router as audit_router
 from app.routes.integrations import router as integrations_router
+from app.routes.documents import router as documents_router
+from app.routes.analytics import router as analytics_router
+from app.routes.team import router as team_router
+from app.routes.support import router as support_router
 
 
 app = FastAPI(
@@ -29,7 +33,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500", "http://localhost:5500"],
+    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,11 +56,15 @@ async def health_check():
     }
 
 
-app.include_router(auth_router, prefix=settings.API_PREFIX)
+app.include_router(auth_router, prefix=f"{settings.API_PREFIX}/auth")
 app.include_router(orchestrator_router, prefix=settings.API_PREFIX)
 app.include_router(approvals_router, prefix=settings.API_PREFIX)
 app.include_router(audit_router, prefix=settings.API_PREFIX)
 app.include_router(integrations_router, prefix=settings.API_PREFIX)
+app.include_router(documents_router, prefix=settings.API_PREFIX)
+app.include_router(analytics_router, prefix=settings.API_PREFIX)
+app.include_router(team_router, prefix=settings.API_PREFIX)
+app.include_router(support_router, prefix=f"{settings.API_PREFIX}/support", tags=["support"])
 
 # Serve the static command-center frontend at /app
 STATIC_DIR = Path(__file__).resolve().parent / "static"
