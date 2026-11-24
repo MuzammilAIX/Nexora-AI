@@ -1,0 +1,389 @@
+"""
+Analytics Agent — Workflow #3 from Section 14.
+
+Design (per Section 8 of the business doc):
+  - Deterministic Python does ALL math (via tools.postgres)
+  - LLM only (a) parses intent, (b) narrates the metrics
+  - Every number in the narrative is verified against the metrics
+    before return — cannot hallucinate revenue.
+
+Output is audit-clean: metrics, narrative, sql_used (for evidence),
+verification_passed (bool).
+"""
+from datetime import datetime, timezone
+from typing import Literal
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from pydantic import BaseModel, ConfigDict, Field
+
+from .base import BaseAgent, AgentInput, AgentOutput
+from ..config import settings
+from ..tools.postgres import get_monthly_sales, get_sales_report
+
+
+class AnalyticsQueryPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Legacy monthly mode
+    period: str | None = Field(default=None, description="Report period as YYYY-MM (legacy)")
+    comparison_period: str | None = Field(default=None, description="Comparison period YYYY-MM")
+
+    # New flexible range mode
+    start_date: str | None = Field(default=None, description="ISO date YYYY-MM-DD")
+    end_date: str | None = Field(default=None, description="ISO date YYYY-MM-DD")
+    granularity: Literal["day", "week", "month", "year"] = "day"
+    range_label: str | None = Field(default=None, description="Human label: last 7 weeks, 10 years")
+
+    focus: Literal["revenue", "products", "customers", "all"] = "all"
+    include_recommendations: bool = True
+
+
+class AnalyticsNarrative(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(description="2-4 sentence executive summary")
+    highlights: list[str] = Field(description="3-5 bullet highlights")
+    recommendations: list[str] = Field(
+        description="2-4 actionable recommendations"
+    )
+    evidence_used: list[str] = Field(
+        description="Sources cited, e.g. 'orders:2026-11', 'products:Widget Pro'"
+    )
+
+
+_SYSTEM_PROMPT = (
+    "You are Nexora AI's analytics narrator. You receive a JSON payload "
+    "containing precomputed sales metrics. Your job is to write a clear "
+    "business narrative around those exact numbers.\n\n"
+    "HARD RULES:\n"
+    "(1) Do NOT invent numbers. Every number you write MUST appear in "
+    "the provided metrics JSON.\n"
+    "(2) Do NOT perform arithmetic. If a percentage is not in the "
+    "metrics, do not compute it.\n"
+    "(3) Cite evidence in `evidence_used` using the form "
+    "`orders:YYYY-MM` and `product:<name>` for each data source used.\n"
+    "(4) If metrics are zero or empty, say so honestly and do not "
+    "guess.\n"
+    "(5) Tone: professional, direct, board-ready."
+)
+
+
+def _plan_prompt(user_request: str, default_period: str, today_iso: str) -> str:
+    return (
+        f"USER REQUEST: {user_request}\n\n"
+        f"TODAY: {today_iso}\n"
+        f"DEFAULT MONTH (legacy): {default_period}\n\n"
+        "EXTRACT the reporting range. Rules:\n"
+        "- Specific month (e.g. November 2026) -> set period=YYYY-MM only.\n"
+        "- Range (today/last week/last 7 weeks/this month/last year/5 years/10 years) "
+        "-> set start_date, end_date (ISO YYYY-MM-DD) AND granularity.\n"
+        "- Granularity: today/yesterday=day, this week/last 7 weeks=week or day, "
+        "this month/last month=day, last year/yearly=month, 5+ years=year.\n"
+        "- Set range_label to the user phrasing (e.g. last 7 weeks, 10-year).\n"
+        "- If both range and period apply, prefer range."
+    )
+def _narrate_prompt(
+    period: str,
+    metrics: dict,
+    comparison: dict | None,
+) -> str:
+    payload = {
+        "period": period,
+        "metrics": metrics,
+        "comparison": comparison,
+    }
+    return (
+        f"Write a business narrative for this analytics payload:\n\n"
+        f"{payload}\n\n"
+        "Produce summary, highlights, recommendations, and evidence_used. "
+        "Every number must appear in the payload. No arithmetic."
+    )
+
+
+class AnalyticsAgent(BaseAgent):
+    name = "analytics"
+
+    async def run(self, payload: AgentInput) -> AgentOutput:
+        try:
+            context = payload.context or {}
+            tenant_id = context.get("tenant_id")
+            user_request = context.get("user_request") or payload.task_description
+
+            if not tenant_id:
+                return AgentOutput(
+                    success=False, error="analytics agent requires tenant_id"
+                )
+
+            default_period = datetime.now(timezone.utc).strftime("%Y-%m")
+
+            llm = ChatOpenAI(
+                model=settings.OPENAI_MODEL,
+                api_key=settings.OPENAI_API_KEY,
+                timeout=90,
+                max_retries=2,
+            ).with_structured_output(AnalyticsQueryPlan)
+
+            today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            plan: AnalyticsQueryPlan = await llm.ainvoke([
+                SystemMessage(content="You extract analytics query parameters."),
+                HumanMessage(content=_plan_prompt(user_request, default_period, today_iso)),
+            ])
+
+            use_range = bool(plan.start_date and plan.end_date)
+            table_payload = None
+            comparison = None
+
+            if use_range:
+                metrics = await get_sales_report(
+                    tenant_id=str(tenant_id),
+                    start_date=plan.start_date,
+                    end_date=plan.end_date,
+                    granularity=plan.granularity,
+                )
+                table_payload = metrics.get("table")
+            else:
+                metrics = await get_monthly_sales(
+                    tenant_id=str(tenant_id),
+                    month=plan.period or default_period,
+                )
+                if plan.comparison_period:
+                    comparison = await get_monthly_sales(
+                        tenant_id=str(tenant_id),
+                        month=plan.comparison_period,
+                    )
+
+            narrate_llm = ChatOpenAI(
+                model=settings.OPENAI_MODEL,
+                api_key=settings.OPENAI_API_KEY,
+                timeout=90,
+                max_retries=2,
+            ).with_structured_output(AnalyticsNarrative)
+
+            narrative: AnalyticsNarrative = await narrate_llm.ainvoke([
+                SystemMessage(content=_SYSTEM_PROMPT),
+                HumanMessage(content=_narrate_prompt(
+                    plan.period, metrics, comparison,
+                )),
+            ])
+
+            # Section 8: compute MoM in Python (not SQL, not LLM) so it
+            # exists in the metrics corpus the verifier checks against.
+            if comparison and comparison.get("total_revenue"):
+                base = comparison["total_revenue"]
+                current = metrics.get("total_revenue", 0.0)
+                metrics["mom_revenue_pct_change"] = (
+                    round((current - base) / base * 100, 2) if base else None
+                )
+                metrics["mom_order_count_delta"] = (
+                    metrics.get("order_count", 0) - comparison.get("order_count", 0)
+                )
+            else:
+                metrics["mom_revenue_pct_change"] = None
+                metrics["mom_order_count_delta"] = None
+
+            verification = _verify_narrative_numbers(narrative, metrics, comparison)
+
+            # ─── Data coverage: which months in range have real data? ───
+            data_coverage = None
+            coverage_note = None
+            if use_range and plan.start_date and plan.end_date:
+                try:
+                    sy, sm = (int(x) for x in plan.start_date.split("-")[:2])
+                    ey, em = (int(x) for x in plan.end_date.split("-")[:2])
+                    expected_months = []
+                    y, m = sy, sm
+                    while (y, m) <= (ey, em):
+                        expected_months.append(f"{y:04d}-{m:02d}")
+                        if m == 12:
+                            y, m = y + 1, 1
+                        else:
+                            m = m + 1
+                    rows = (table_payload or {}).get("rows") or []
+                    months_with_data = []
+                    months_missing = []
+                    for mon in expected_months:
+                        matched = [r for r in rows if str(r[0])[:7] == mon]
+                        if matched and any(float(r[2] or 0) != 0 for r in matched):
+                            months_with_data.append(mon)
+                        else:
+                            months_missing.append(mon)
+                    data_coverage = {
+                        "expected_months": expected_months,
+                        "months_with_data": months_with_data,
+                        "months_missing": months_missing,
+                        "is_complete": len(months_missing) == 0,
+                        "coverage_pct": round(100 * len(months_with_data) / max(1, len(expected_months)), 1),
+                    }
+                    if months_missing:
+                        if len(months_missing) == 1:
+                            coverage_note = f"No sales records exist for {months_missing[0]}. Only {len(months_with_data)} of {len(expected_months)} months in the requested range have data."
+                        else:
+                            missing_str = ", ".join(months_missing)
+                            coverage_note = f"No sales records exist for: {missing_str}. Only {len(months_with_data)} of {len(expected_months)} months in the requested range have data. This may indicate a data gap in your records, or months with no recorded orders."
+                except Exception as cov_exc:
+                    data_coverage = {"error": str(cov_exc)}
+                    coverage_note = None
+
+
+            # ─── Data coverage: which months have real data? ───
+            data_coverage = None
+            coverage_note = None
+            if use_range and plan.start_date and plan.end_date:
+                try:
+                    sy, sm = (int(x) for x in plan.start_date.split("-")[:2])
+                    ey, em = (int(x) for x in plan.end_date.split("-")[:2])
+                    expected_months = []
+                    y, m = sy, sm
+                    while (y, m) <= (ey, em):
+                        expected_months.append(f"{y:04d}-{m:02d}")
+                        if m == 12:
+                            y, m = y + 1, 1
+                        else:
+                            m = m + 1
+                    rows = (table_payload or {}).get("rows") or []
+                    months_with_data = []
+                    months_missing = []
+                    for mon in expected_months:
+                        matched = [r for r in rows if str(r[0])[:7] == mon]
+                        if matched and any(float(r[2] or 0) != 0 for r in matched):
+                            months_with_data.append(mon)
+                        else:
+                            months_missing.append(mon)
+                    data_coverage = {
+                        "expected_months": expected_months,
+                        "months_with_data": months_with_data,
+                        "months_missing": months_missing,
+                        "is_complete": len(months_missing) == 0,
+                        "coverage_pct": round(100 * len(months_with_data) / max(1, len(expected_months)), 1),
+                    }
+                    if months_missing:
+                        if len(months_missing) == 1:
+                            coverage_note = f"No sales records exist for {months_missing[0]}. Only {len(months_with_data)} of {len(expected_months)} months in the requested range have data."
+                        else:
+                            missing_str = ", ".join(months_missing)
+                            coverage_note = f"No sales records exist for: {missing_str}. Only {len(months_with_data)} of {len(expected_months)} months in the requested range have data. This may indicate a data gap in your records, or months with no recorded orders."
+                except Exception as cov_exc:
+                    data_coverage = {"error": str(cov_exc)}
+                    coverage_note = None
+
+            return AgentOutput(
+                success=True,
+                result={
+                    "period": plan.period,
+                    "comparison_period": plan.comparison_period,
+                    "range_label": plan.range_label,
+                    "granularity": plan.granularity if use_range else "month",
+                    "metrics": metrics,
+                    "comparison": comparison,
+                    "narrative": narrative.model_dump(),
+                    "table": table_payload,
+                    "sql_sources": [
+                        "orders: date range window",
+                        "order_items: sum(line_total) grouped by product",
+                        "products: name+category join",
+                    ],
+                    "row_data_count": metrics.get("line_item_count", 0),
+                    "verification_passed": verification,
+                    "data_coverage": data_coverage,
+                    "coverage_note": coverage_note,
+                    "data_driven": True,
+                },
+            )
+
+        except Exception as exc:
+            return AgentOutput(success=False, error=str(exc))
+
+
+def _verify_narrative_numbers(
+    narrative: AnalyticsNarrative,
+    metrics: dict,
+    comparison: dict | None,
+) -> dict:
+    """
+    Every number the LLM wrote must trace back to a metric field.
+    This is our Section 8 guard against hallucinated arithmetic.
+    """
+    corpus = _all_numbers(metrics)
+    if comparison:
+        corpus.update(_all_numbers(comparison))
+
+    findings: list[str] = []
+    for text_field in [narrative.summary, *narrative.highlights, *narrative.recommendations]:
+        for num in _extract_numbers(text_field):
+            if not _number_matches_any(num, corpus):
+                findings.append(f"unverified number: {num}")
+
+    return {
+        "passed": len(findings) == 0,
+        "unverified_numbers": findings,
+        "metric_numbers_available": len(corpus),
+    }
+
+
+def _all_numbers(obj) -> set[float]:
+    out: set[float] = set()
+    if isinstance(obj, dict):
+        for v in obj.values():
+            out |= _all_numbers(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            out |= _all_numbers(v)
+    elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        out.add(round(float(obj), 2))
+    return out
+
+
+def _extract_numbers(s: str) -> list[float]:
+    """
+    Extract metric-like numbers from prose.
+
+    Handles:
+      - currency:   "$55,625.00" -> 55625.00
+      - thousands:  "1,112.50"   -> 1112.50
+      - percents:   "10.4%"      -> 10.4
+      - integers:   "50"         -> 50.0
+
+    Ignores:
+      - bare 4-digit years (2000-2100) like "2026" in "November 2026"
+        so the verifier does not flag a legitimate date reference.
+    """
+    import re
+
+    if not s:
+        return []
+
+    # Normalize: remove currency symbols and thousands separators.
+    # Do NOT remove % — we want to keep the number, just drop the sign.
+    cleaned = s.replace("$", "").replace(",", "").replace("\u00a0", " ")
+
+    # Match signed decimal numbers.
+    raw = re.findall(r"-?\d+(?:\.\d+)?", cleaned)
+
+    out: list[float] = []
+    for token in raw:
+        try:
+            value = round(float(token), 2)
+        except ValueError:
+            continue
+
+        # Skip bare 4-digit years (2000-2100) — these come from dates
+        # like "November 2026" and are not metric values.
+        if "." not in token and 2000 <= value <= 2100 and float(token).is_integer():
+            continue
+
+        out.append(value)
+
+    return out
+
+
+def _number_matches_any(n: float, corpus: set[float], tol: float = 0.5) -> bool:
+    if n in corpus:
+        return True
+    for c in corpus:
+        if abs(n - c) <= tol:
+            return True
+        if c != 0 and abs((n - c) / c) < 0.01:
+            return True
+    return False

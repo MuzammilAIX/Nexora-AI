@@ -59,6 +59,7 @@ _APPROVABLE_AGENTS = {
     "operations": None,
     "calendar": None,   # handled by action_kind dispatch (calendar_create_event)
     "bulk_email": None,   # handled by action_kind dispatch (bulk_email_send)
+    "analytics": None,   # handled by action_kind dispatch (report_publish)
 }
 
 
@@ -68,12 +69,18 @@ async def list_approvals(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    stmt = (
-        select(Approval)
-        .where(Approval.tenant_id == user.tenant_id)
-        .where(Approval.status == status)
-        .order_by(Approval.created_at.desc())
-    )
+    stmt = select(Approval).where(Approval.tenant_id == user.tenant_id)
+
+    # Treat "approved" as a group that includes both approved and executed.
+    # The approve endpoint stores status="executed" on success, so a strict
+    # status="approved" filter would return zero rows. Keep this in sync with
+    # the analytics queries (analytics.py lines 148, 232).
+    if status == "approved":
+        stmt = stmt.where(Approval.status.in_(["approved", "executed"]))
+    else:
+        stmt = stmt.where(Approval.status == status)
+
+    stmt = stmt.order_by(Approval.created_at.desc())
     rows = (await session.execute(stmt)).scalars().all()
     return [
         {
@@ -128,6 +135,7 @@ async def reject_approval(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(require_permission("approve_actions")),
 ):
+    decision_note = (body.note or "").strip() or None
     stmt = (
         select(Approval)
         .where(Approval.id == approval_id)
@@ -141,7 +149,7 @@ async def reject_approval(
 
     from datetime import datetime, timezone
     row.status = "rejected"
-    row.decided_reason = (body.note or '').strip() or None
+    row.decided_reason = decision_note
     row.decided_by = user.id
     row.decided_at = datetime.now(timezone.utc)
     await session.commit()
@@ -168,6 +176,7 @@ async def approve_approval(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(require_permission("approve_actions")),
 ):
+    decision_note = (body.note or "").strip() or None
     stmt = (
         select(Approval)
         .where(Approval.id == approval_id)
@@ -522,6 +531,22 @@ async def approve_approval(
             except Exception as exc:
                 execution["error"] = f"calendar create_event failed: {exc}"
 
+    elif action_kind == "report_publish" and row.agent_type == "analytics":
+        # Report approval is a state-only action — the report preview was
+        # already shown to the user. Approving marks the run "official".
+        # No outbound call. No idempotency risk.
+        execution = {
+            "success": True,
+            "result": {
+                "approved_report": {
+                    "range_label": proposed.get("range_label"),
+                    "start_date": proposed.get("start_date"),
+                    "end_date": proposed.get("end_date"),
+                    "metrics": proposed.get("metrics", {}),
+                }
+            },
+            "error": None,
+        }
     elif action_kind == "execute_agent" and row.agent_type == "lead":
         from ..tools.crm import create_task
         from ..tools.audit import log_event
@@ -670,7 +695,7 @@ async def approve_approval(
     else:
         row.status = "pending"
 
-    row.decided_reason = (body.note or '').strip() or None
+    row.decided_reason = decision_note
     row.execution_result = execution
     await session.commit()
 

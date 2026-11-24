@@ -1,4 +1,4 @@
-﻿"""
+"""
 Calendar tool surface for agents.
 
 Routes through CalendarConnector(tenant_id=...), which loads encrypted tokens
@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..integrations.calendar import CalendarConnector, CalendarNotConnected
+from .schedule import local_tz, local_tz_name
 
 
 def _ensure_windows_loop_policy() -> None:
@@ -38,11 +39,11 @@ async def _connector(tenant_id: str | None) -> CalendarConnector:
 async def list_events(
     tenant_id: str | None = None,
     when: str = "today",
-    tz: str = "UTC",
+    tz: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read-only. `when`: 'today' | 'tomorrow' | 'week' | ISO date."""
     c = await _connector(tenant_id)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(local_tz())
     if when == "today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
@@ -56,7 +57,7 @@ async def list_events(
         end = now + timedelta(days=7)
     else:
         try:
-            start = datetime.fromisoformat(when).replace(tzinfo=timezone.utc)
+            start = datetime.fromisoformat(when).replace(tzinfo=local_tz())
         except ValueError:
             start = now
         end = start + timedelta(days=1)
@@ -74,7 +75,7 @@ async def create_event(
     end_iso: str = "",
     attendees: list[str] | None = None,
     description: str = "",
-    tz: str = "UTC",
+    tz: str | None = None,
 ) -> dict[str, Any]:
     """DANGER: Only call from the approval executor, NEVER from the agent."""
     c = await _connector(tenant_id)
@@ -84,7 +85,7 @@ async def create_event(
         end_iso=end_iso,
         attendees=attendees or [],
         description=description,
-        timezone_str=tz,
+        timezone_str=tz or local_tz_name(),
     )
 
 

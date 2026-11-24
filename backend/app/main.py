@@ -56,9 +56,23 @@ async def health_check():
     }
 
 
+from .tools.schedule import set_request_tz, reset_request_tz
+
+
+@app.middleware("http")
+async def _timezone_middleware(request, call_next):
+    token = set_request_tz(request.headers.get("x-timezone"))
+    try:
+        return await call_next(request)
+    finally:
+        reset_request_tz(token)
+
+
 app.include_router(auth_router, prefix=f"{settings.API_PREFIX}/auth")
 app.include_router(orchestrator_router, prefix=settings.API_PREFIX)
 app.include_router(approvals_router, prefix=settings.API_PREFIX)
+from .routes.schedule import router as schedule_router
+app.include_router(schedule_router, prefix=settings.API_PREFIX)
 app.include_router(audit_router, prefix=settings.API_PREFIX)
 app.include_router(integrations_router, prefix=settings.API_PREFIX)
 app.include_router(documents_router, prefix=settings.API_PREFIX)

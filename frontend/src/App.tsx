@@ -11,7 +11,7 @@ import { LayoutDashboard,
   Settings,
   Bell,
   Search,
-  Activity as ActivityIcon, CheckCheck, ListTodo, BookOpen, BarChart3, Users, LifeBuoy } from 'lucide-react'
+  Activity as ActivityIcon, CheckCheck, ListTodo, BookOpen, BarChart3, Users, LifeBuoy, Calendar } from 'lucide-react'
 import { RunsAreaChart, StatusDonutChart } from './components/DashboardCharts'
 import { Login } from './components/Login'
 import { Signup } from './pages/Signup'
@@ -35,6 +35,7 @@ import { useNotifications, type Notification } from './hooks/useNotifications'
 
 import { NotificationDropdown } from './components/NotificationDropdown'
 import { Team } from './pages/Team'
+import { Schedule } from './pages/Schedule'
 
 const navGroups = [
   {
@@ -51,6 +52,7 @@ const navGroups = [
     items: [
       { to: '/agents', label: 'Agent Management', icon: Bot },
       { to: '/tasks', label: 'Tasks', icon: ListTodo },
+      { to: '/schedule', label: 'Schedule', icon: Calendar },
       { to: '/mission-control', label: 'Mission Control', icon: ShieldAlert },
       { to: '/approvals', label: 'Approvals', icon: CheckCheck },
       { to: '/executions', label: 'Executions', icon: ListChecks },
@@ -258,7 +260,7 @@ function App() {
               <Route path="/agents" element={<Agents />} />
               <Route path="/mission-control" element={<MissionControl />} />
               <Route path="/approvals" element={<Approvals />} />
-              <Route path="/tasks" element={<Tasks />} />
+              <Route path="/tasks" element={<Tasks />} />`r`n              <Route path="/schedule" element={<Schedule />} />
               <Route path="/crm" element={<CRM />} />
               <Route path="/assistant" element={<Assistant />} />
               <Route path="/workflows" element={<Workflows />} />

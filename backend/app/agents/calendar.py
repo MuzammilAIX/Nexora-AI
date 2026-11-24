@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .base import BaseAgent, AgentInput, AgentOutput
 from ..config import settings
 from ..tools.calendar import list_events, format_events
+from ..tools.schedule import local_tz, local_tz_name
 
 
 # ------------------------------------------------------------------ schemas
@@ -61,6 +62,7 @@ class CalendarRequest(BaseModel):
 
 
 def _build_system_prompt() -> str:
+    now = datetime.now(local_tz())
     return (
         "You are Nexora AI's calendar specialist. Classify the user's request "
         "into one of two intents and fill the matching fields.\n\n"
@@ -68,12 +70,13 @@ def _build_system_prompt() -> str:
         "Fill `when` with 'today', 'tomorrow', 'week', or an explicit ISO date. "
         "Leave all create-fields empty.\n\n"
         "INTENT = 'create': the user wants to schedule a meeting. "
-        "Fill `summary` (short title), `start_iso`, `end_iso` (ISO datetimes), "
-        "`attendees` (list of email addresses extracted from the request), "
-        "and optional `description`.\n\n"
-        "If the user does not specify a time, pick a reasonable default: "
-        "tomorrow at 10:00 in UTC, 30-minute duration.\n\n"
-        "Today's date for reference: " + datetime.now(timezone.utc).date().isoformat()
+        "Fill `summary` (short title), `start_iso`, `end_iso`, "
+        "`attendees` (email addresses from the request) and optional `description`.\n\n"
+        "TIME RULES: every time the user mentions is in THEIR local timezone, "
+        + local_tz_name() + ". Output start_iso and end_iso as ISO 8601 with that "
+        "timezone's UTC offset, for example " + now.replace(microsecond=0).isoformat() + ". "
+        "If no time is given, use tomorrow at 10:00 local time for 30 minutes.\n\n"
+        "Current local date and time: " + now.strftime("%A %Y-%m-%d %H:%M")
     )
 
 
@@ -140,7 +143,7 @@ class CalendarAgent(BaseAgent):
             start_iso = parsed.start_iso
             end_iso = parsed.end_iso
             if not start_iso or not end_iso:
-                tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+                tomorrow = (datetime.now(local_tz()) + timedelta(days=1)).replace(
                     hour=10, minute=0, second=0, microsecond=0
                 )
                 start_iso = tomorrow.isoformat()

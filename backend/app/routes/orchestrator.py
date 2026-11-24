@@ -221,6 +221,7 @@ AGENT_DESCRIPTIONS = {
     "review":     "Quality gate for agent output before it reaches a human decision-maker.",
     "calendar":   "Read today's/this week's calendar and propose meetings; write actions require approval.",
     "bulk_email": "Send personalized emails to one or many recipients in a single approval-gated campaign.",
+    "briefing":   "Compile the daily schedule: internal plan, Google Calendar and pending approvals (read-only).",
 }
 
 @router.get("/agents")

@@ -1,0 +1,115 @@
+"""Schedule helpers: timezone, recurrence expansion, range queries."""
+from __future__ import annotations
+
+import calendar as _cal
+import os
+from datetime import date, datetime, timedelta, timezone, tzinfo
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import and_, or_, select
+
+from app.database import SessionFactory
+from app.database.schedule_models import ScheduleEntry
+
+RECURRENCES = {"DAILY", "WEEKLY", "MONTHLY"}
+
+
+def local_tz() -> tzinfo:
+    """Business timezone. Override with the NEXORA_TZ environment variable."""
+    name = os.getenv("NEXORA_TZ", "Asia/Karachi")
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        return timezone(timedelta(hours=5))
+
+
+def ensure_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=local_tz())
+
+
+def day_bounds(day: date | None = None) -> tuple[datetime, datetime]:
+    tz = local_tz()
+    if day is None:
+        day = datetime.now(tz).date()
+    start = datetime(day.year, day.month, day.day, tzinfo=tz)
+    return start, start + timedelta(days=1)
+
+
+def month_bounds(year: int, month: int) -> tuple[datetime, datetime]:
+    tz = local_tz()
+    start = datetime(year, month, 1, tzinfo=tz)
+    ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
+    return start, datetime(ny, nm, 1, tzinfo=tz)
+
+
+def _add_months(dt: datetime, n: int) -> datetime:
+    m = dt.month - 1 + n
+    y = dt.year + m // 12
+    mo = m % 12 + 1
+    d = min(dt.day, _cal.monthrange(y, mo)[1])
+    return dt.replace(year=y, month=mo, day=d)
+
+
+def _occurrence(e: ScheduleEntry, s: datetime, s_end: datetime | None) -> dict[str, Any]:
+    return {
+        "entry_id": str(e.id),
+        "title": e.title,
+        "entry_type": e.entry_type,
+        "start": s.isoformat(),
+        "end": s_end.isoformat() if s_end else None,
+        "all_day": bool(e.all_day),
+        "recurrence": e.recurrence,
+        "assignee_id": str(e.assignee_id) if e.assignee_id else None,
+        "notes": e.notes,
+        "source": "schedule",
+    }
+
+
+def expand_entry(e: ScheduleEntry, range_start: datetime, range_end: datetime) -> list[dict[str, Any]]:
+    start = ensure_aware(e.start_at)
+    end = ensure_aware(e.end_at)
+    dur = (end - start) if end else None
+    out: list[dict[str, Any]] = []
+
+    def add(s: datetime) -> None:
+        s_end = s + dur if dur else None
+        if s < range_end and (s_end or s) >= range_start:
+            out.append(_occurrence(e, s, s_end))
+
+    if not e.recurrence:
+        add(start)
+        return out
+
+    until = ensure_aware(e.recurrence_until)
+    step = {"DAILY": 1, "WEEKLY": 7}.get(e.recurrence)
+    k = max(0, ((range_start - start).days // step) - 1) if step else 0
+    for _ in range(2000):
+        s = start + timedelta(days=step * k) if step else _add_months(start, k)
+        if s >= range_end or (until and s > until):
+            break
+        add(s)
+        k += 1
+    return out
+
+
+async def list_occurrences(tenant_id: str, range_start: datetime, range_end: datetime) -> list[dict[str, Any]]:
+    async with SessionFactory() as s:
+        stmt = select(ScheduleEntry).where(
+            ScheduleEntry.tenant_id == UUID(str(tenant_id)),
+            ScheduleEntry.start_at < range_end,
+            or_(
+                ScheduleEntry.recurrence.is_not(None),
+                ScheduleEntry.end_at >= range_start,
+                and_(ScheduleEntry.end_at.is_(None), ScheduleEntry.start_at >= range_start),
+            ),
+        )
+        rows = (await s.execute(stmt)).scalars().all()
+    items: list[dict[str, Any]] = []
+    for e in rows:
+        items.extend(expand_entry(e, range_start, range_end))
+    items.sort(key=lambda i: i["start"])
+    return items

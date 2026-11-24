@@ -19,16 +19,22 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .base import BaseAgent, AgentInput, AgentOutput
 from ..config import settings
-from ..tools.postgres import get_monthly_sales
+from ..tools.postgres import get_monthly_sales, get_sales_report
 
 
 class AnalyticsQueryPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    period: str = Field(description="Report period as YYYY-MM")
-    comparison_period: str | None = Field(
-        default=None, description="Comparison period YYYY-MM, optional"
-    )
+    # Legacy monthly mode
+    period: str | None = Field(default=None, description="Report period as YYYY-MM (legacy)")
+    comparison_period: str | None = Field(default=None, description="Comparison period YYYY-MM")
+
+    # New flexible range mode
+    start_date: str | None = Field(default=None, description="ISO date YYYY-MM-DD")
+    end_date: str | None = Field(default=None, description="ISO date YYYY-MM-DD")
+    granularity: Literal["day", "week", "month", "year"] = "day"
+    range_label: str | None = Field(default=None, description="Human label: last 7 weeks, 10 years")
+
     focus: Literal["revenue", "products", "customers", "all"] = "all"
     include_recommendations: bool = True
 
@@ -63,16 +69,20 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _plan_prompt(user_request: str, default_period: str) -> str:
+def _plan_prompt(user_request: str, default_period: str, today_iso: str) -> str:
     return (
         f"USER REQUEST: {user_request}\n\n"
-        f"DEFAULT PERIOD (use if user did not specify): {default_period}\n\n"
-        "Extract the reporting period and focus. If the user mentioned "
-        "a month name, map it to YYYY-MM. If they mentioned two months, "
-        "the later one is `period` and the earlier one is `comparison_period`."
+        f"TODAY: {today_iso}\n"
+        f"DEFAULT MONTH (legacy): {default_period}\n\n"
+        "EXTRACT the reporting range. Rules:\n"
+        "- Specific month (e.g. November 2026) -> set period=YYYY-MM only.\n"
+        "- Range (today/last week/last 7 weeks/this month/last year/5 years/10 years) "
+        "-> set start_date, end_date (ISO YYYY-MM-DD) AND granularity.\n"
+        "- Granularity: today/yesterday=day, this week/last 7 weeks=week or day, "
+        "this month/last month=day, last year/yearly=month, 5+ years=year.\n"
+        "- Set range_label to the user phrasing (e.g. last 7 weeks, 10-year).\n"
+        "- If both range and period apply, prefer range."
     )
-
-
 def _narrate_prompt(
     period: str,
     metrics: dict,
@@ -114,22 +124,35 @@ class AnalyticsAgent(BaseAgent):
                 max_retries=2,
             ).with_structured_output(AnalyticsQueryPlan)
 
+            today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
             plan: AnalyticsQueryPlan = await llm.ainvoke([
                 SystemMessage(content="You extract analytics query parameters."),
-                HumanMessage(content=_plan_prompt(user_request, default_period)),
+                HumanMessage(content=_plan_prompt(user_request, default_period, today_iso)),
             ])
 
-            metrics = await get_monthly_sales(
-                tenant_id=str(tenant_id),
-                month=plan.period,
-            )
-
+            use_range = bool(plan.start_date and plan.end_date)
+            table_payload = None
             comparison = None
-            if plan.comparison_period:
-                comparison = await get_monthly_sales(
+
+            if use_range:
+                metrics = await get_sales_report(
                     tenant_id=str(tenant_id),
-                    month=plan.comparison_period,
+                    start_date=plan.start_date,
+                    end_date=plan.end_date,
+                    granularity=plan.granularity,
                 )
+                table_payload = metrics.get("table")
+            else:
+                metrics = await get_monthly_sales(
+                    tenant_id=str(tenant_id),
+                    month=plan.period or default_period,
+                )
+                if plan.comparison_period:
+                    comparison = await get_monthly_sales(
+                        tenant_id=str(tenant_id),
+                        month=plan.comparison_period,
+                    )
 
             narrate_llm = ChatOpenAI(
                 model=settings.OPENAI_MODEL,
@@ -162,22 +185,134 @@ class AnalyticsAgent(BaseAgent):
 
             verification = _verify_narrative_numbers(narrative, metrics, comparison)
 
+            # ─── Data coverage: which months in range have real data? ───
+            data_coverage = None
+            coverage_note = None
+            if use_range and plan.start_date and plan.end_date:
+                try:
+                    sy, sm = (int(x) for x in plan.start_date.split("-")[:2])
+                    ey, em = (int(x) for x in plan.end_date.split("-")[:2])
+                    expected_months = []
+                    y, m = sy, sm
+                    while (y, m) <= (ey, em):
+                        expected_months.append(f"{y:04d}-{m:02d}")
+                        if m == 12:
+                            y, m = y + 1, 1
+                        else:
+                            m = m + 1
+                    rows = (table_payload or {}).get("rows") or []
+                    months_with_data = []
+                    months_missing = []
+                    for mon in expected_months:
+                        matched = [r for r in rows if str(r[0])[:7] == mon]
+                        if matched and any(float(r[2] or 0) != 0 for r in matched):
+                            months_with_data.append(mon)
+                        else:
+                            months_missing.append(mon)
+                    data_coverage = {
+                        "expected_months": expected_months,
+                        "months_with_data": months_with_data,
+                        "months_missing": months_missing,
+                        "is_complete": len(months_missing) == 0,
+                        "coverage_pct": round(100 * len(months_with_data) / max(1, len(expected_months)), 1),
+                    }
+                    if months_missing:
+                        if len(months_missing) == 1:
+                            coverage_note = f"No sales records exist for {months_missing[0]}. Only {len(months_with_data)} of {len(expected_months)} months in the requested range have data."
+                        else:
+                            missing_str = ", ".join(months_missing)
+                            coverage_note = f"No sales records exist for: {missing_str}. Only {len(months_with_data)} of {len(expected_months)} months in the requested range have data. This may indicate a data gap in your records, or months with no recorded orders."
+                except Exception as cov_exc:
+                    data_coverage = {"error": str(cov_exc)}
+                    coverage_note = None
+
+
+            # ─── Data coverage: which months have real data? ───
+            data_coverage = None
+            coverage_note = None
+            if use_range and plan.start_date and plan.end_date:
+                try:
+                    sy, sm = (int(x) for x in plan.start_date.split("-")[:2])
+                    ey, em = (int(x) for x in plan.end_date.split("-")[:2])
+                    expected_months = []
+                    y, m = sy, sm
+                    while (y, m) <= (ey, em):
+                        expected_months.append(f"{y:04d}-{m:02d}")
+                        if m == 12:
+                            y, m = y + 1, 1
+                        else:
+                            m = m + 1
+                    rows = (table_payload or {}).get("rows") or []
+                    months_with_data = []
+                    months_missing = []
+                    for mon in expected_months:
+                        matched = [r for r in rows if str(r[0])[:7] == mon]
+                        if matched and any(float(r[2] or 0) != 0 for r in matched):
+                            months_with_data.append(mon)
+                        else:
+                            months_missing.append(mon)
+                    data_coverage = {
+                        "expected_months": expected_months,
+                        "months_with_data": months_with_data,
+                        "months_missing": months_missing,
+                        "is_complete": len(months_missing) == 0,
+                        "coverage_pct": round(100 * len(months_with_data) / max(1, len(expected_months)), 1),
+                    }
+                    if months_missing:
+                        if len(months_missing) == 1:
+                            coverage_note = f"No sales records exist for {months_missing[0]}. Only {len(months_with_data)} of {len(expected_months)} months in the requested range have data."
+                        else:
+                            missing_str = ", ".join(months_missing)
+                            coverage_note = f"No sales records exist for: {missing_str}. Only {len(months_with_data)} of {len(expected_months)} months in the requested range have data. This may indicate a data gap in your records, or months with no recorded orders."
+                except Exception as cov_exc:
+                    data_coverage = {"error": str(cov_exc)}
+                    coverage_note = None
+
+            # ─── Report publishing requires manager approval for multi-month ranges ───
+            _span_months = 0
+            if use_range and plan.start_date and plan.end_date:
+                try:
+                    _sy, _sm = (int(x) for x in plan.start_date.split("-")[:2])
+                    _ey, _em = (int(x) for x in plan.end_date.split("-")[:2])
+                    _span_months = (_ey - _sy) * 12 + (_em - _sm) + 1
+                except Exception:
+                    _span_months = 0
+            _requires_report_approval = bool(use_range) and _span_months > 1
+            _approval_reason = (
+                f"Publish official report for {plan.range_label} ({_span_months} months)"
+                if _requires_report_approval else None
+            )
             return AgentOutput(
                 success=True,
                 result={
                     "period": plan.period,
                     "comparison_period": plan.comparison_period,
+                    "range_label": plan.range_label,
+                    "granularity": plan.granularity if use_range else "month",
                     "metrics": metrics,
                     "comparison": comparison,
                     "narrative": narrative.model_dump(),
+                    "table": table_payload,
                     "sql_sources": [
-                        "orders:date_trunc(month,order_date) = :month",
-                        "order_items:sum(line_total) grouped by product",
-                        "products:name+category join",
+                        "orders: date range window",
+                        "order_items: sum(line_total) grouped by product",
+                        "products: name+category join",
                     ],
                     "row_data_count": metrics.get("line_item_count", 0),
                     "verification_passed": verification,
+                    "data_coverage": data_coverage,
+                    "coverage_note": coverage_note,
                     "data_driven": True,
+                    "requires_approval": _requires_report_approval,
+                    "action_kind": ("report_publish" if _requires_report_approval else None),
+                    "approval_reason": _approval_reason,
+                    "proposed_action": ({
+                        "action_kind": "report_publish",
+                        "range_label": plan.range_label,
+                        "start_date": plan.start_date,
+                        "end_date": plan.end_date,
+                        "metrics": metrics,
+                    } if _requires_report_approval else None),
                 },
             )
 

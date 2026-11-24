@@ -51,3 +51,5 @@ from .document_models import Document  # noqa: F401,E402
 
 from .team_models import Role, Invitation  # noqa: F401,E402
 from .agent_models import Agent  # noqa: F401,E402
+
+from .schedule_models import ScheduleEntry  # noqa: F401,E402

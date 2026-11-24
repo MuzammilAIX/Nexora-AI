@@ -3,6 +3,8 @@ import { Send, Bot, User, Loader2, Sparkles, CheckCircle2, ChevronDown, ChevronU
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import { AnalyticsResult } from '../components/AnalyticsResult'
+import { ScheduleResult } from '../components/ScheduleResult'
 
 interface Message {
   id: string
@@ -16,12 +18,17 @@ interface Message {
   isReport?: boolean
   isChart?: boolean
   chunkData?: any[]
+  analyticsResults?: any[]
+  scheduleResults?: any[]
   actionCard?: {
     type: 'approval' | 'workflow' | 'task'
     id: string
     title: string
     meta: string
+    status?: 'pending' | 'approved' | 'rejected'
+    decisionNote?: string | null
   }
+  approvalDetail?: any
   monitor?: {
     id: string
     target: string
@@ -107,6 +114,50 @@ export function Assistant() {
     setTimeout(() => setCopiedId(null), 1500)
   }
 
+  // Poll pending approvals and update the chat card when their status changes
+  useEffect(() => {
+    const pending = messages
+      .filter(m => m.actionCard && (m.actionCard.status === 'pending' || m.actionCard.status === undefined))
+      .map(m => m.actionCard!.id)
+    if (pending.length === 0) return
+
+    let cancelled = false
+    const interval = setInterval(async () => {
+      const token = localStorage.getItem('nexora_token')
+      for (const approvalId of pending) {
+        try {
+          const resp = await fetch(`/api/v1/approvals/${approvalId}`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+          })
+          if (!resp.ok) continue
+          const data = await resp.json()
+          const status = (data.status || '').toLowerCase()
+          if (status === 'pending') continue
+          if (cancelled) return
+          setMessages(prev => prev.map(m =>
+            m.actionCard && m.actionCard.id === approvalId
+              ? {
+                  ...m,
+                  approvalDetail: data,
+                  actionCard: {
+                    ...m.actionCard,
+                    status: (status === 'approved' || status === 'executed') ? 'approved' as const : 'rejected' as const,
+                    decisionNote: data.decision_note || data.note || null,
+                  },
+                }
+              : m
+          ))
+        } catch {
+          // ignore transient poll errors
+        }
+      }
+    }, 5000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [messages])
   function rateMessage(id: string, type: 'up' | 'down') {
     setRatings(prev => ({ ...prev, [id]: type }))
   }
@@ -185,6 +236,8 @@ export function Assistant() {
 
     try {
       let assistantContent = ''
+      const analyticsCollector: any[] = []
+      const scheduleCollector: any[] = []
       let plan = undefined
       let isReport = false
       let isChart = false
@@ -234,25 +287,38 @@ export function Assistant() {
               continue
             }
             if (t.status === 'pending_approval') {
-              parts.push(`\u23F8 **Pending approval** \u2014 ${agent}: ${t.reason || t.task_description || 'needs your review'}`)
+              parts.push(`${agent}: ${t.reason || t.task_description || 'needs your review'}`)
               if (!firstPendingApproval) {
                 firstPendingApproval = {
                   type: 'approval' as const,
                   id: t.approval_id,
                   title: `Agent: ${agent}`,
                   meta: t.reason || 'Requires review',
+                  status: 'pending' as const,
                 }
               }
             } else if (t.status === 'done' && t.result) {
               const r = t.result
-              if (r.action === 'calendar_list') {
+              if (agent === 'briefing' && r.items) {
+                const n = r.items.length
+                parts.push(`\u2705 **briefing**: ${r.date || 'schedule'} \u2014 ${n} event${n !== 1 ? 's' : ''}`)
+                if (n === 0) {
+                  parts.push(`No events scheduled for ${r.date || 'this day'}.`)
+                }
+                scheduleCollector.push(r)
+              } else if (r.action === 'calendar_list') {
                 const evts = r.events || []
                 if (evts.length === 0) {
-                  parts.push(`\uD83D\uDCC5 No events ${r.when || 'today'}.`)
+                  parts.push(`\uD83D\uDCC5 No events for ${r.when || 'today'}.`)
                 } else {
                   parts.push(`\uD83D\uDCC5 **${evts.length} event${evts.length > 1 ? 's' : ''}** ${r.when || 'today'}:`)
                   parts.push(r.formatted || '')
                 }
+              } else if (agent === 'analytics' && r.table?.columns) {
+                const m = r.metrics || {}
+                const rev = Number(m.total_revenue || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })
+                parts.push(`\u2705 **analytics**: ${r.range_label || r.period || 'report'} \u2014 Revenue: $${rev} \u00b7 Orders: ${m.order_count || 0} \u00b7 Customers: ${m.distinct_customers || 0}`)
+                analyticsCollector.push(r)
               } else {
                 const text = r.summary || r.formatted || (typeof r === 'string' ? r : JSON.stringify(r).slice(0, 300))
                 parts.push(`\u2705 **${agent}**: ${text}`)
@@ -274,6 +340,8 @@ export function Assistant() {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
         content: assistantContent,
+        analyticsResults: analyticsCollector.length > 0 ? analyticsCollector : undefined,
+        scheduleResults: scheduleCollector.length > 0 ? scheduleCollector : undefined,
         isReport,
         isChart,
         chunkData,
@@ -370,6 +438,12 @@ export function Assistant() {
                   {msg.role === 'user' ? msg.content : (
                     <div className="prose prose-invert prose-sm max-w-none prose-table:border prose-table:border-border prose-th:bg-panelHover prose-th:p-2 prose-td:p-2 prose-td:border-t prose-td:border-border">
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                      {msg.analyticsResults?.map((r, i) => (
+                        <AnalyticsResult key={i} result={r} />
+                      ))}
+                      {msg.scheduleResults?.map((r, i) => (
+                        <ScheduleResult key={i} result={r} />
+                      ))}
                     </div>
                   )}
                 </div>
@@ -404,54 +478,65 @@ export function Assistant() {
                         → Open in Approvals page
                       </a>
                     </div>
-                    <div className="flex p-2 gap-2 bg-panelHover">
-                      <button
-                        onClick={async () => {
-                          const token = localStorage.getItem('nexora_token')
-                          try {
-                            await fetch(`/api/v1/approvals/${msg.actionCard!.id}/approve`, {
-                              method: 'POST',
-                              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                              body: JSON.stringify({ note: 'Approved via AI Assistant' })
-                            })
-                            setMessages(prev => [...prev, {
-                              id: Date.now().toString(),
-                              role: 'assistant',
-                              content: '✅ Approval submitted successfully.',
-                              timestamp: new Date().toISOString()
-                            }])
-                          } catch (e) {
-                            alert('Failed to approve')
-                          }
-                        }}
-                        className="flex-1 py-1.5 text-xs font-medium bg-success hover:bg-success/90 text-white rounded transition-colors flex items-center justify-center gap-1"
-                      >
-                        <CheckCircle2 className="w-3 h-3" /> Approve
-                      </button>
-                      <button
-                        onClick={async () => {
-                          const token = localStorage.getItem('nexora_token')
-                          try {
-                            await fetch(`/api/v1/approvals/${msg.actionCard!.id}/reject`, {
-                              method: 'POST',
-                              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                              body: JSON.stringify({ note: 'Rejected via AI Assistant' })
-                            })
-                            setMessages(prev => [...prev, {
-                              id: Date.now().toString(),
-                              role: 'assistant',
-                              content: '❌ Approval rejected.',
-                              timestamp: new Date().toISOString()
-                            }])
-                          } catch (e) {
-                            alert('Failed to reject')
-                          }
-                        }}
-                        className="flex-1 py-1.5 text-xs font-medium bg-danger hover:bg-danger/90 text-white rounded transition-colors flex items-center justify-center gap-1"
-                      >
-                        <Trash2 className="w-3 h-3" /> Reject
-                      </button>
-                    </div>
+                    {msg.actionCard.status === 'pending' || msg.actionCard.status === undefined ? (
+                      <div className="px-4 py-2 bg-panelHover text-xs text-warning flex items-center gap-2">
+                        <span>⏳</span>
+                        <span>Awaiting decision on the Approvals page</span>
+                      </div>
+                    ) : msg.actionCard.status === 'approved' ? (
+                      <div className="px-4 py-2 bg-success/10 border-t border-success/30 text-xs text-success flex items-start gap-2">
+                        <span>✅</span>
+                        <div className="flex-1">
+                          <div className="font-semibold">Approved</div>
+                          {msg.actionCard.decisionNote && (
+                            <div className="text-[11px] text-success/80 mt-0.5">{msg.actionCard.decisionNote}</div>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="px-4 py-2 bg-danger/10 border-t border-danger/30 text-xs text-danger flex items-start gap-2">
+                        <span>❌</span>
+                        <div className="flex-1">
+                          <div className="font-semibold">Rejected</div>
+                          {msg.actionCard.decisionNote && (
+                            <div className="text-[11px] text-danger/80 mt-0.5">{msg.actionCard.decisionNote}</div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                
+                {msg.actionCard?.status === 'approved' && msg.approvalDetail?.proposed_action?.prepared_result?.metrics?.table?.columns && (
+                  <div className="mt-3 w-full">
+                    <AnalyticsResult result={{
+                      table: msg.approvalDetail.proposed_action.prepared_result.metrics.table,
+                      metrics: msg.approvalDetail.proposed_action.prepared_result.metrics || {},
+                      range_label: msg.approvalDetail.proposed_action.prepared_result.range_label,
+                       narrative: msg.approvalDetail.proposed_action.prepared_result.narrative,
+                       coverage_note: (() => {
+                         const m = msg.approvalDetail.proposed_action.prepared_result.metrics || {}
+                         const rows = m.table?.rows || []
+                         const start = m.start_date, end = m.end_date
+                         if (!start || !end) return null
+                         const months = []
+                         const [sy, sm] = start.split('-').map(Number)
+                         const [ey, em] = end.split('-').map(Number)
+                         for (let y = sy, mo = sm; y < ey || (y === ey && mo <= em); mo === 12 ? (y++, mo = 1) : mo++) {
+                           months.push(y + '-' + String(mo).padStart(2, '0'))
+                         }
+                         const present = new Set(rows.map((r) => String(r[0])))
+                         const missing = months.filter((mo) => !present.has(mo))
+                         if (missing.length === 0) return null
+                         if (missing.length === months.length) {
+                           return 'No sales records found for any month in ' + start + ' to ' + end + '.'
+                         }
+                         const presentLabels = months.filter((mo) => present.has(mo)).join(', ')
+                         const missingLabels = missing.length > 6 ? (missing[0] + ' through ' + missing[missing.length - 1] + ' (' + missing.length + ' months)') : missing.join(', ')
+                         return 'Data exists only for ' + presentLabels + '. No records for: ' + missingLabels + '.'
+                       })(),
+                    }} />
                   </div>
                 )}
 

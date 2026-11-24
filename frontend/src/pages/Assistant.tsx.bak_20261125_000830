@@ -1,0 +1,646 @@
+import { useState, useRef, useEffect } from 'react'
+import { Send, Bot, User, Loader2, Sparkles, CheckCircle2, ChevronDown, ChevronUp, Download, Trash2, LifeBuoy, Copy, RefreshCw, ThumbsUp, ThumbsDown, Mic, Search } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import { AnalyticsResult } from '../components/AnalyticsResult'
+import { ScheduleResult } from '../components/ScheduleResult'
+
+interface Message {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  plan?: {
+    agent: string
+    status: string
+    details: string
+  }
+  isReport?: boolean
+  isChart?: boolean
+  chunkData?: any[]
+  analyticsResults?: any[]
+  scheduleResults?: any[]
+  actionCard?: {
+    type: 'approval' | 'workflow' | 'task'
+    id: string
+    title: string
+    meta: string
+    status?: 'pending' | 'approved' | 'rejected'
+    decisionNote?: string | null
+  }
+  monitor?: {
+    id: string
+    target: string
+    status: 'active' | 'triggered'
+    lastChecked: string
+  }
+  timestamp: string
+}
+
+type ChatMode = 'standard' | 'support'
+
+const SLASH_COMMANDS = [
+  { cmd: '/report', desc: 'Generate a sales report' },
+  { cmd: '/chart', desc: 'Show a visual chart' },
+  { cmd: '/help', desc: 'Show all available commands' },
+]
+
+
+const MODELS = [
+  { id: 'precise', label: 'Precise', color: 'text-blue-500', desc: 'For data & reports' },
+  { id: 'creative', label: 'Creative', color: 'text-purple-500', desc: 'For brainstorming' },
+  { id: 'analyst', label: 'Analyst', color: 'text-emerald-500', desc: 'For logic & SQL' },
+  { id: 'operator', label: 'Operator', color: 'text-orange-500', desc: 'For running workflows' },
+] as const
+
+const PROMPT_CHIPS = [
+  'Generate sales report',
+  'Show my pending approvals',
+  'Analyze HubSpot data',
+]
+
+export function Assistant() {
+  const [mode, setMode] = useState<ChatMode>('standard')
+  const [model, setModel] = useState<'precise' | 'creative' | 'analyst' | 'operator'>('precise')
+  const [messages, setMessages] = useState<Message[]>(() => {
+    try { return JSON.parse(localStorage.getItem('nexora_chat_' + mode) || '[]') } catch { return [] }
+  })
+  const [input, setInput] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+  const [expandedPlan, setExpandedPlan] = useState<string | null>(null)
+  const [showSlashMenu, setShowSlashMenu] = useState(false)
+  const [isListening, setIsListening] = useState(false)
+  const [ratings, setRatings] = useState<Record<string, 'up' | 'down'>>({})
+  const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const recognitionRef = useRef<any>(null)
+
+  useEffect(() => {
+    localStorage.setItem('nexora_chat_' + mode, JSON.stringify(messages))
+  }, [messages, mode])
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, isLoading])
+
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto'
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 200) + 'px'
+    }
+  }, [input])
+
+  function switchMode(newMode: ChatMode) {
+    setMode(newMode)
+    try {
+      const saved = localStorage.getItem('nexora_chat_' + newMode)
+      setMessages(saved ? JSON.parse(saved) : [])
+    } catch { setMessages([]) }
+  }
+
+  function clearChat() {
+    setMessages([])
+    localStorage.removeItem(`nexora_chat_${mode}`)
+  }
+
+  function copyToClipboard(text: string, msgId: string) {
+    navigator.clipboard.writeText(text)
+    setCopiedId(msgId)
+    setTimeout(() => setCopiedId(null), 1500)
+  }
+
+  // Poll pending approvals and update the chat card when their status changes
+  useEffect(() => {
+    const pending = messages
+      .filter(m => m.actionCard && (m.actionCard.status === 'pending' || m.actionCard.status === undefined))
+      .map(m => m.actionCard!.id)
+    if (pending.length === 0) return
+
+    let cancelled = false
+    const interval = setInterval(async () => {
+      const token = localStorage.getItem('nexora_token')
+      for (const approvalId of pending) {
+        try {
+          const resp = await fetch(`/api/v1/approvals/${approvalId}`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+          })
+          if (!resp.ok) continue
+          const data = await resp.json()
+          const status = (data.status || '').toLowerCase()
+          if (status === 'pending') continue
+          if (cancelled) return
+          setMessages(prev => prev.map(m =>
+            m.actionCard && m.actionCard.id === approvalId
+              ? {
+                  ...m,
+                  approvalDetail: data,
+                  actionCard: {
+                    ...m.actionCard,
+                    status: (status === 'approved' || status === 'executed') ? 'approved' as const : 'rejected' as const,
+                    decisionNote: data.decision_note || data.note || null,
+                  },
+                }
+              : m
+          ))
+        } catch {
+          // ignore transient poll errors
+        }
+      }
+    }, 5000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [messages])
+  function rateMessage(id: string, type: 'up' | 'down') {
+    setRatings(prev => ({ ...prev, [id]: type }))
+  }
+
+  function toggleVoice() {
+    if (isListening) {
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch (e) {}
+      }
+      setIsListening(false);
+      return;
+    }
+
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert('Voice input is not supported in this browser. Please use Chrome or Edge.');
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'en-US';
+    recognition.continuous = true;       // KEEPS MIC OPEN
+    recognition.interimResults = true;   // CAPTURES LIVE AS YOU SPEAK
+
+    recognition.onstart = () => {
+      console.log('🎙️ Microphone LIVE. Speak now...');
+      setIsListening(true);
+    };
+
+    recognition.onresult = (event: any) => {
+      let transcript = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        transcript += event.results[i][0].transcript;
+      }
+      console.log('🗣️ Live:', transcript);
+      setInput(prev => (prev + ' ' + transcript).trim());
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error('Voice error:', event.error);
+      if (event.error === 'not-allowed') {
+        alert('Microphone access denied. Click the padlock in your URL bar to allow.');
+      }
+      setIsListening(false);
+    };
+
+    recognition.onend = () => {
+      console.log('🔇 Voice recognition stopped.');
+      setIsListening(false);
+    };
+
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+    } catch (err) {
+      console.error(err);
+      setIsListening(false);
+    }
+  }
+
+  async function handleSend(e?: React.FormEvent) {
+    if (e) e.preventDefault()
+    if (!input.trim() || isLoading) return
+
+    const userMsg: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: input,
+      timestamp: new Date().toISOString(),
+    }
+    setMessages(prev => [...prev, userMsg])
+    setInput('')
+    setShowSlashMenu(false)
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    setIsLoading(true)
+
+    try {
+      let assistantContent = ''
+      const analyticsCollector: any[] = []
+      const scheduleCollector: any[] = []
+      let plan = undefined
+      let isReport = false
+      let isChart = false
+      let chunkData = undefined
+      let actionCard = undefined
+      let monitor = undefined
+
+      if (mode === 'support') {
+        const token = localStorage.getItem('nexora_token')
+        const res = await fetch('/api/v1/support/ticket', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({ subject: "Support Request via AI", description: input, priority: "high" })
+        })
+        if (!res.ok) throw new Error("Failed to connect to support servers.")
+        const data = await res.json()
+        assistantContent = `Forwarded ticket #${data.ticket_id?.slice(0, 8) || 'SUP-NEW'}. A human agent will review this shortly.`
+      } else {
+        // Real orchestrator call — replaces the old hardcoded keyword stub
+        const token = localStorage.getItem('nexora_token')
+        try {
+          const res = await fetch('/api/v1/orchestrator/run', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`,
+            },
+            body: JSON.stringify({ user_request: input }),
+          })
+
+          if (!res.ok) {
+            const errBody = await res.json().catch(() => ({}))
+            throw new Error(errBody.detail || `Orchestrator error ${res.status}`)
+          }
+
+          const result = await res.json()
+          const taskResults = result.task_results || []
+          const parts: string[] = []
+          let firstPendingApproval: any = null
+
+          for (const t of taskResults) {
+            const agent = t.agent_type || 'agent'
+            if (t.result && t.result.action === 'email_needs_input') {
+              const prompts: string[] = t.result.question_prompts || []
+              const lines = prompts.map((p: string, i: number) => `${i+1}. ${p}`)
+              parts.push(`I need a bit more information before I draft the email:\n\n${lines.join('\n')}\n\nReply with the missing details and I'll draft the email for your approval.`)
+              continue
+            }
+            if (t.status === 'pending_approval') {
+              parts.push(`${agent}: ${t.reason || t.task_description || 'needs your review'}`)
+              if (!firstPendingApproval) {
+                firstPendingApproval = {
+                  type: 'approval' as const,
+                  id: t.approval_id,
+                  title: `Agent: ${agent}`,
+                  meta: t.reason || 'Requires review',
+                  status: 'pending' as const,
+                }
+              }
+            } else if (t.status === 'done' && t.result) {
+              const r = t.result
+              if (agent === 'briefing' && r.items) {
+                const n = r.items.length
+                parts.push(`\u2705 **briefing**: ${r.date || 'schedule'} \u2014 ${n} event${n !== 1 ? 's' : ''}`)
+                if (n === 0) {
+                  parts.push(`No events scheduled for ${r.date || 'this day'}.`)
+                }
+                scheduleCollector.push(r)
+              } else if (r.action === 'calendar_list') {
+                const evts = r.events || []
+                if (evts.length === 0) {
+                  parts.push(`\uD83D\uDCC5 No events ${r.when || 'today'}.`)
+                } else {
+                  parts.push(`\uD83D\uDCC5 **${evts.length} event${evts.length > 1 ? 's' : ''}** ${r.when || 'today'}:`)
+                  parts.push(r.formatted || '')
+                }
+              } else if (agent === 'analytics' && r.table?.columns) {
+                const m = r.metrics || {}
+                const rev = Number(m.total_revenue || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })
+                parts.push(`\u2705 **analytics**: ${r.range_label || r.period || 'report'} \u2014 Revenue: $${rev} \u00b7 Orders: ${m.order_count || 0} \u00b7 Customers: ${m.distinct_customers || 0}`)
+                analyticsCollector.push(r)
+              } else {
+                const text = r.summary || r.formatted || (typeof r === 'string' ? r : JSON.stringify(r).slice(0, 300))
+                parts.push(`\u2705 **${agent}**: ${text}`)
+              }
+            } else if (t.status === 'failed') {
+              parts.push(`\u274C **${agent}** failed: ${t.error || 'unknown error'}`)
+            }
+          }
+
+          if (firstPendingApproval) actionCard = firstPendingApproval
+          assistantContent = parts.length > 0 ? parts.join('\n\n') : `Status: ${result.status || 'completed'}`
+          plan = { agent: taskResults[0]?.agent_type || 'orchestrator', status: 'done', details: result.status || 'completed' }
+        } catch (err: any) {
+          assistantContent = `I could not reach the orchestrator: ${err.message}`
+        }
+      }
+
+      const assistantMsg: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: assistantContent,
+        analyticsResults: analyticsCollector.length > 0 ? analyticsCollector : undefined,
+        scheduleResults: scheduleCollector.length > 0 ? scheduleCollector : undefined,
+        isReport,
+        isChart,
+        chunkData,
+        actionCard,
+        monitor,
+        plan,
+        timestamp: new Date().toISOString(),
+      }
+      setMessages(prev => [...prev, assistantMsg])
+    } catch (error) {
+      console.error(error)
+      setMessages(prev => [...prev, { 
+        id: Date.now().toString(), 
+        role: 'assistant', 
+        content: '**Error:** Failed to communicate with the server.', 
+        timestamp: new Date().toISOString() 
+      }])
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+    }
+    if (e.key === '/' && input.length === 0) {
+      setShowSlashMenu(true)
+    }
+    if (e.key === 'Escape') {
+      setShowSlashMenu(false)
+    }
+  }
+
+  function downloadCSV() {
+    const csv = "data:text/csv;charset=utf-8,Region,Revenue\nNorth America,124500\nEurope,89200\nAsia Pacific,67800"
+    const link = document.createElement("a")
+    link.href = encodeURI(csv); link.download = "sales_report.csv"
+    document.body.appendChild(link); link.click(); document.body.removeChild(link)
+  }
+
+  const isSupport = mode === 'support'
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-4rem)] bg-background p-4 md:p-8 max-w-5xl mx-auto w-full">
+      <div className="mb-6 flex items-center justify-between flex-wrap gap-4">
+        <div className="flex items-center gap-3">
+          <div className={`p-2 rounded-lg ${isSupport ? 'bg-warning/10' : 'bg-accent/10'}`}>
+            {isSupport ? <LifeBuoy className="w-6 h-6 text-warning" /> : <Sparkles className="w-6 h-6 text-accent" />}
+          </div>
+          <div>
+            <h1 className="text-2xl font-bold text-white">{isSupport ? 'Platform Support' : 'Nexora AI Assistant'}</h1>
+            <p className="text-sm text-muted">{isSupport ? 'Get help with any issue in the platform' : 'Your intelligent agentic workflow orchestrator'}</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center bg-panel border border-border rounded-lg p-1">
+            <button onClick={() => switchMode('standard')} className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors ${!isSupport ? 'bg-background text-white shadow-sm' : 'text-muted hover:text-white'}`}><Sparkles className="w-4 h-4" /> Standard</button>
+            <button onClick={() => switchMode('support')} className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors ${isSupport ? 'bg-background text-white shadow-sm' : 'text-muted hover:text-white'}`}><LifeBuoy className="w-4 h-4" /> Support</button>
+          </div>
+          {!isSupport && (
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value as any)}
+              className="bg-panel border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-accent"
+            >
+              {MODELS.map(m => (
+                <option key={m.id} value={m.id}>{m.label} — {m.desc}</option>
+              ))}
+            </select>
+          )}
+          {messages.length > 0 && (
+            <button onClick={clearChat} className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-danger hover:bg-danger/10 rounded-lg transition-colors"><Trash2 className="w-4 h-4" /> Clear</button>
+          )}
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto mb-6 space-y-6 pr-2">
+        {messages.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center text-center">
+            {isSupport ? <LifeBuoy className="w-12 h-12 text-muted mb-4 opacity-50" /> : <Bot className="w-12 h-12 text-muted mb-4 opacity-50" />}
+            <h2 className="text-lg font-semibold text-white mb-1">{isSupport ? 'How can we help you?' : 'How can I help you today?'}</h2>
+            <p className="text-sm text-muted max-w-md">{isSupport ? 'Describe the issue you are facing.' : 'Ask Nexora to run a workflow, analyze data, or manage your integrations.'}</p>
+          </div>
+        ) : (
+          messages.map((msg) => (
+            <div key={msg.id} id={'msg-' + msg.id} className={`flex gap-4 ${msg.role === 'user' ? 'flex-row-reverse' : ''} rounded-lg transition-all duration-300`}>
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${msg.role === 'user' ? 'bg-panel border border-border' : isSupport ? 'bg-warning text-white' : 'bg-accent text-white'}`}>
+                {msg.role === 'user' ? <User className="w-4 h-4 text-muted" /> : isSupport ? <LifeBuoy className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+              </div>
+              <div className={`max-w-[80%] flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${msg.role === 'user' ? 'bg-accent text-white rounded-tr-sm' : 'bg-panel border border-border text-white rounded-tl-sm shadow-sm'}`}>
+                  {msg.role === 'user' ? msg.content : (
+                    <div className="prose prose-invert prose-sm max-w-none prose-table:border prose-table:border-border prose-th:bg-panelHover prose-th:p-2 prose-td:p-2 prose-td:border-t prose-td:border-border">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                      {msg.analyticsResults?.map((r, i) => (
+                        <AnalyticsResult key={i} result={r} />
+                      ))}
+                      {msg.scheduleResults?.map((r, i) => (
+                        <ScheduleResult key={i} result={r} />
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {msg.isChart && msg.chunkData && (
+                  <div className="mt-2 w-full bg-panel border border-border rounded-xl p-4 shadow-sm" style={{ height: 200 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={msg.chunkData}>
+                        <XAxis dataKey="name" stroke="var(--color-muted)" fontSize={10} />
+                        <YAxis stroke="var(--color-muted)" fontSize={10} />
+                        <Tooltip contentStyle={{ backgroundColor: 'var(--bg-panel)', borderColor: 'var(--border-color)', color: 'var(--text-primary)' }} />
+                        <Bar dataKey="revenue" fill="#8B5CF6" radius={[4, 4, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+
+                {msg.actionCard && (
+                  <div className="mt-3 w-full max-w-sm bg-panel border border-border rounded-xl shadow-sm overflow-hidden">
+                    <div className="p-4 border-b border-border">
+                      <div className="flex items-center gap-2 text-xs font-semibold text-warning uppercase mb-2">
+                        {msg.actionCard.type} Request
+                      </div>
+                      <h4 className="text-sm font-bold text-white mb-1">{msg.actionCard.title}</h4>
+                      <p className="text-xs text-muted">{msg.actionCard.meta}</p>
+                    </div>
+                    <div className="px-4 py-2 border-b border-border bg-panel">
+                      <a
+                        href={`/approvals?id=${msg.actionCard.id}`}
+                        className="text-xs font-medium text-primary hover:underline flex items-center gap-1"
+                      >
+                        → Open in Approvals page
+                      </a>
+                    </div>
+                    {msg.actionCard.status === 'pending' || msg.actionCard.status === undefined ? (
+                      <div className="px-4 py-2 bg-panelHover text-xs text-warning flex items-center gap-2">
+                        <span>⏳</span>
+                        <span>Awaiting decision on the Approvals page</span>
+                      </div>
+                    ) : msg.actionCard.status === 'approved' ? (
+                      <div className="px-4 py-2 bg-success/10 border-t border-success/30 text-xs text-success flex items-start gap-2">
+                        <span>✅</span>
+                        <div className="flex-1">
+                          <div className="font-semibold">Approved</div>
+                          {msg.actionCard.decisionNote && (
+                            <div className="text-[11px] text-success/80 mt-0.5">{msg.actionCard.decisionNote}</div>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="px-4 py-2 bg-danger/10 border-t border-danger/30 text-xs text-danger flex items-start gap-2">
+                        <span>❌</span>
+                        <div className="flex-1">
+                          <div className="font-semibold">Rejected</div>
+                          {msg.actionCard.decisionNote && (
+                            <div className="text-[11px] text-danger/80 mt-0.5">{msg.actionCard.decisionNote}</div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                
+                {msg.actionCard?.status === 'approved' && msg.approvalDetail?.proposed_action?.table?.columns && (
+                  <div className="mt-3 w-full">
+                    <AnalyticsResult result={msg.approvalDetail.proposed_action} />
+                  </div>
+                )}
+
+                {msg.monitor && (
+                  <div className="mt-3 w-full max-w-sm bg-panel border border-border rounded-xl shadow-sm overflow-hidden p-4">
+                    <div className="flex items-center gap-3 mb-2">
+                      <div className="p-2 bg-accent/10 rounded-full animate-pulse">
+                        <RefreshCw className="w-4 h-4 text-accent" />
+                      </div>
+                      <div>
+                        <h4 className="text-sm font-bold text-white">Monitoring Active</h4>
+                        <p className="text-xs text-muted">Target: {msg.monitor.target}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] text-muted mt-2 pt-2 border-t border-border">
+                      <span>ID: {msg.monitor.id}</span>
+                      <span>Last checked: just now</span>
+                    </div>
+                  </div>
+                )}
+
+                {msg.role === 'assistant' && (
+                  <div className="flex items-center gap-3 mt-2 px-1">
+                    <button onClick={() => copyToClipboard(msg.content, msg.id)} className="flex items-center gap-1 text-muted hover:text-white transition-colors" title="Copy">
+                      <Copy className="w-3.5 h-3.5" />
+                      {copiedId === msg.id && <span className="text-[10px] text-success">Copied!</span>}
+                    </button>
+                    <button className="text-muted hover:text-white transition-colors" title="Regenerate"><RefreshCw className="w-3.5 h-3.5" /></button>
+                    <button onClick={() => rateMessage(msg.id, 'up')} className={`transition-colors ${ratings[msg.id] === 'up' ? 'text-success' : 'text-muted hover:text-white'}`} title="Good"><ThumbsUp className="w-3.5 h-3.5" /></button>
+                    <button onClick={() => rateMessage(msg.id, 'down')} className={`transition-colors ${ratings[msg.id] === 'down' ? 'text-danger' : 'text-muted hover:text-white'}`} title="Bad"><ThumbsDown className="w-3.5 h-3.5" /></button>
+                    {msg.isReport && (
+                      <button onClick={downloadCSV} className="flex items-center gap-1 text-accent hover:text-accentHover font-medium ml-2"><Download className="w-3.5 h-3.5" /> CSV</button>
+                    )}
+                  </div>
+                )}
+                <span className="text-[10px] text-muted mt-1 px-1">{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+              </div>
+            </div>
+          ))
+        )}
+        {isLoading && (
+          <div className="flex gap-4">
+            <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${isSupport ? 'bg-warning' : 'bg-accent'}`}><Bot className="w-4 h-4 text-white" /></div>
+            <div className="bg-panel border border-border px-4 py-3 rounded-2xl rounded-tl-sm flex items-center gap-2 shadow-sm"><Loader2 className="w-4 h-4 text-accent animate-spin" /><span className="text-sm text-secondary">Nexora is analyzing...</span></div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="shrink-0 max-w-3xl mx-auto w-full relative">
+        {showSlashMenu && (
+          <div className="absolute bottom-full left-0 mb-2 w-full max-w-sm bg-panel border border-border rounded-xl shadow-lg overflow-hidden z-50">
+            {SLASH_COMMANDS.map(c => (
+              <button key={c.cmd} onClick={() => { setInput(c.cmd + ' '); setShowSlashMenu(false); textareaRef.current?.focus(); }} className="w-full text-left px-4 py-2 hover:bg-panelHover transition-colors flex items-center gap-2">
+                <span className="font-mono text-accent text-sm">{c.cmd}</span>
+                <span className="text-muted text-xs">{c.desc}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {!isSupport && (
+          <div className="flex items-center gap-2 mb-2 px-2">
+            <span className="text-xs text-muted">Model:</span>
+            <span className={`text-xs font-semibold ${MODELS.find(m => m.id === model)?.color}`}>
+              {MODELS.find(m => m.id === model)?.label}
+            </span>
+          </div>
+        )}
+        <div className="flex gap-2 mb-3 overflow-x-auto pb-1">
+          {PROMPT_CHIPS.map(chip => (
+            <button key={chip} onClick={() => setInput(chip)} className="shrink-0 px-3 py-1.5 bg-panel border border-border rounded-full text-xs text-secondary hover:text-white hover:border-accent transition-colors">{chip}</button>
+          ))}
+        </div>
+
+        <form onSubmit={handleSend} className={`relative flex items-end bg-panel border border-border rounded-2xl shadow-sm transition-all focus-within:ring-2 ${isSupport ? 'focus-within:ring-warning/20 focus-within:border-warning' : 'focus-within:ring-accent/20 focus-within:border-accent'}`}>
+          <textarea ref={textareaRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={handleKeyDown} placeholder={isSupport ? "Describe the issue..." : "Ask Nexora anything (type / for commands)..."} className="flex-1 bg-transparent border-none text-white placeholder:text-muted px-5 py-4 max-h-[200px] rounded-2xl focus:outline-none text-sm resize-none" rows={1} disabled={isLoading} />
+          <button type="button" onClick={toggleVoice} className={`absolute right-14 bottom-3 p-2 rounded-lg transition-all duration-300 ${isListening ? 'bg-danger text-white animate-pulse shadow-[0_0_12px_rgba(239,68,68,0.8)] shadow-[0_0_10px_rgba(239,68,68,0.7)]' : 'text-muted hover:text-white bg-transparent'}`} title={isListening ? "Stop Recording" : "Start Voice Input"}><Mic className={`w-5 h-5 ${isListening ? 'scale-110' : ''}`} /></button>
+          <button type="submit" disabled={!input.trim() || isLoading} className={`absolute right-2 bottom-2 p-2 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed mb-[6px] ${isSupport ? 'bg-warning hover:bg-warning/90' : 'bg-accent hover:bg-accentHover'}`}><Send className="w-4 h-4" /></button>
+        </form>
+        <p className="text-center text-[10px] text-muted mt-2">{isSupport ? 'For emergencies, email urgent@nexora.ai' : 'Nexora can make mistakes. Please verify sensitive actions.'}</p>
+      </div>
+
+      {searchOpen && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-start justify-center pt-24" onClick={() => setSearchOpen(false)}>
+          <div className="bg-panel border border-border rounded-xl shadow-2xl w-full max-w-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-3 p-4 border-b border-border">
+              <Search className="w-4 h-4 text-muted" />
+              <input
+                autoFocus
+                type="text"
+                placeholder="Search past messages... (Esc to close)"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="flex-1 bg-transparent text-white placeholder:text-muted focus:outline-none text-sm"
+              />
+            </div>
+            <div className="max-h-[400px] overflow-y-auto">
+              {messages
+                .filter(m => m.content.toLowerCase().includes(searchQuery.toLowerCase()))
+                .map(m => (
+                  <div key={m.id} className="p-4 border-b border-border last:border-0 hover:bg-panelHover cursor-pointer" onClick={() => {
+                    setSearchOpen(false)
+                    setTimeout(() => {
+                      const el = document.getElementById('msg-' + m.id)
+                      el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                      el?.classList.add('ring-2', 'ring-accent')
+                      setTimeout(() => el?.classList.remove('ring-2', 'ring-accent'), 2000)
+                    }, 100)
+                  }}>
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className={`text-xs font-semibold uppercase ${m.role === 'user' ? 'text-accent' : 'text-success'}`}>
+                        {m.role}
+                      </span>
+                      <span className="text-xs text-muted">{new Date(m.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                    <p className="text-sm text-white line-clamp-2">
+                      {m.content.replace(/[#*`|]/g, '').slice(0, 150)}
+                      {m.content.length > 150 ? '...' : ''}
+                    </p>
+                  </div>
+                ))}
+              {messages.filter(m => m.content.toLowerCase().includes(searchQuery.toLowerCase())).length === 0 && (
+                <div className="p-8 text-center text-muted text-sm">
+                  No messages found
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

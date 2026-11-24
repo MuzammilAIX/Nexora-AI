@@ -1,0 +1,115 @@
+"""Daily briefing: internal schedule + Google Calendar + pending approvals."""
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime
+from typing import Any
+
+from sqlalchemy import text
+
+from app.database import SessionFactory
+from .schedule import day_bounds, list_occurrences, local_tz
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_google(ev: dict[str, Any]) -> tuple[datetime, datetime | None, bool]:
+    tz = local_tz()
+    s = ev.get("start", {})
+    e = ev.get("end", {})
+    if s.get("dateTime"):
+        start = datetime.fromisoformat(s["dateTime"]).astimezone(tz)
+        end = datetime.fromisoformat(e["dateTime"]).astimezone(tz) if e.get("dateTime") else None
+        return start, end, False
+    start = datetime.fromisoformat(s.get("date")).replace(tzinfo=tz)
+    return start, None, True
+
+
+async def _google_items(tenant_id: str, start: datetime, end: datetime) -> tuple[list[dict], str | None]:
+    try:
+        from app.integrations.calendar import CalendarConnector
+        events = await CalendarConnector(tenant_id=str(tenant_id)).list_events(
+            time_min=start.isoformat(), time_max=end.isoformat()
+        )
+    except Exception as exc:
+        logger.warning("briefing: google calendar unavailable: %s", exc)
+        return [], "Google Calendar is not connected or unavailable."
+    items = []
+    for ev in events:
+        try:
+            s, e, all_day = _parse_google(ev)
+        except Exception:
+            continue
+        items.append({
+            "entry_id": ev.get("id"),
+            "title": ev.get("summary", "(no title)"),
+            "entry_type": "meeting",
+            "start": s.isoformat(),
+            "end": e.isoformat() if e else None,
+            "all_day": all_day,
+            "source": "google_calendar",
+        })
+    return items, None
+
+
+async def _pending_approvals(tenant_id: str) -> list[dict[str, Any]]:
+    async with SessionFactory() as s:
+        rows = (await s.execute(
+            text(
+                "SELECT agent_type, reason FROM approvals "
+                "WHERE tenant_id = CAST(:t AS uuid) AND status = 'pending' "
+                "ORDER BY created_at DESC LIMIT 10"
+            ),
+            {"t": str(tenant_id)},
+        )).all()
+    return [{"agent": r[0], "reason": r[1]} for r in rows]
+
+
+def _fmt_item(i: dict[str, Any]) -> str:
+    if i.get("all_day"):
+        when = "All day"
+    else:
+        s = datetime.fromisoformat(i["start"]).strftime("%H:%M")
+        when = s
+        if i.get("end"):
+            when += "-" + datetime.fromisoformat(i["end"]).strftime("%H:%M")
+    tag = "" if i.get("source") == "schedule" else " [Google Calendar]"
+    return f"- {when}  {i['title']} ({i.get('entry_type', 'event')}){tag}"
+
+
+async def build_briefing(tenant_id: str, day: date | None = None) -> dict[str, Any]:
+    start, end = day_bounds(day)
+    internal = await list_occurrences(tenant_id, start, end)
+    google, g_note = await _google_items(tenant_id, start, end)
+    approvals = await _pending_approvals(tenant_id)
+
+    items = internal + google
+
+    # Deduplicate items with identical title + start + end (defensive against
+    # duplicate source events from Google Calendar syncs / retries).
+    seen = set()
+    deduped_items = []
+    for it in items:
+        key = (it.get("title", ""), it.get("start", ""), it.get("end", ""))
+        if key not in seen:
+            seen.add(key)
+            deduped_items.append(it)
+    items = deduped_items
+
+    items.sort(key=lambda i: (not i.get("all_day", False), i["start"]))
+
+    lines = [f"Schedule for {start.strftime('%A, %d %b %Y')}"]
+    lines += [_fmt_item(i) for i in items] or ["- Nothing scheduled."]
+    if g_note:
+        lines.append(f"(Note: {g_note})")
+    if approvals:
+        lines.append(f"\nPending approvals: {len(approvals)}")
+        lines += [f"- {a['agent']}: {a['reason']}" for a in approvals[:5]]
+
+    return {
+        "date": start.date().isoformat(),
+        "items": items,
+        "pending_approvals": approvals,
+        "google_note": g_note,
+        "formatted": "\n".join(lines),
+    }

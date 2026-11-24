@@ -1,0 +1,231 @@
+"""Briefing agent: read-only schedule/calendar queries with natural time-range parsing."""
+from __future__ import annotations
+
+import re
+from datetime import datetime, timedelta, date
+
+from .base import BaseAgent, AgentInput, AgentOutput
+from ..tools.briefing import build_briefing
+from ..tools.schedule import local_tz, list_occurrences
+
+
+MONTHS = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+    'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6, 'jul': 7, 'aug': 8,
+    'sep': 9, 'sept': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+TOMORROW_FORMS = ('tomorrow', 'tommorow', 'tommor', 'tomorow', 'tomorr')
+YESTERDAY_FORMS = ('yesterday', 'yesterdy', 'yesterdya')
+
+
+def _parse_range(req: str, today: date) -> tuple:
+    """Parse a natural-language time range. Returns (start_date, end_date)."""
+    req = (req or '').lower()
+
+    m = re.search(r'\b(?:until|till|through|to|by|before)\s+(?:([a-z]+)\s+)?(\d{1,2})(?:st|nd|rd|th)?(?:\s+([a-z]+))?', req)
+    if m:
+        mon_name = m.group(1) or m.group(3)
+        day_num = m.group(2)
+        if mon_name and mon_name.lower() in MONTHS:
+            try:
+                end = date(today.year, MONTHS[mon_name.lower()], int(day_num))
+                if end < today:
+                    end = date(today.year + 1, MONTHS[mon_name.lower()], int(day_num))
+                return today, end
+            except ValueError:
+                pass
+
+    m = re.search(r'\bnext\s+(\d+)\s+days?', req)
+    if m:
+        return today, today + timedelta(days=int(m.group(1)))
+
+    m = re.search(r'\bnext\s+(\d+)\s+weeks?', req)
+    if m:
+        return today, today + timedelta(days=int(m.group(1)) * 7)
+
+    if 'next week' in req:
+        days_to_mon = (today.weekday()) % 7
+        mon = today - timedelta(days=days_to_mon) + timedelta(days=7)
+        return mon, mon + timedelta(days=6)
+    if 'this week' in req or 'current week' in req:
+        days_to_mon = (today.weekday()) % 7
+        mon = today - timedelta(days=days_to_mon)
+        return mon, mon + timedelta(days=6)
+
+    if 'next month' in req:
+        if today.month == 12:
+            start = date(today.year + 1, 1, 1)
+        else:
+            start = date(today.year, today.month + 1, 1)
+        if start.month == 12:
+            end = date(start.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end = date(start.year, start.month + 1, 1) - timedelta(days=1)
+        return start, end
+    if 'this month' in req or 'current month' in req:
+        start = date(today.year, today.month, 1)
+        if start.month == 12:
+            end = date(start.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end = date(start.year, start.month + 1, 1) - timedelta(days=1)
+        return start, end
+
+    WEEKDAYS = {
+        'monday': 0, 'mon': 0, 'tuesday': 1, 'tue': 1, 'tues': 1,
+        'wednesday': 2, 'wed': 2, 'thursday': 3, 'thu': 3, 'thur': 3, 'thurs': 3,
+        'friday': 4, 'fri': 4, 'saturday': 5, 'sat': 5, 'sunday': 6, 'sun': 6,
+    }
+    for wd_name, wd_idx in WEEKDAYS.items():
+        if re.search(r'\b' + wd_name + r'\b', req):
+            days_ahead = (wd_idx - today.weekday()) % 7
+            if days_ahead == 0 and 'next' in req:
+                days_ahead = 7
+            d = today + timedelta(days=days_ahead)
+            return d, d
+
+    m = re.search(r'\b([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?\b', req)
+    if m and m.group(1).lower() in MONTHS:
+        try:
+            d = date(today.year, MONTHS[m.group(1).lower()], int(m.group(2)))
+            if d < today:
+                d = date(today.year + 1, MONTHS[m.group(1).lower()], int(m.group(2)))
+            return d, d
+        except ValueError:
+            pass
+
+    if any(f in req for f in TOMORROW_FORMS):
+        d = today + timedelta(days=1)
+        return d, d
+    if any(f in req for f in YESTERDAY_FORMS):
+        d = today - timedelta(days=1)
+        return d, d
+
+    return today, today
+
+
+def _format_range(items, start, end):
+    """Format items grouped by day, showing ALL days including empty ones + holidays."""
+    try:
+        import holidays as _holidays
+        pk_holidays = _holidays.Pakistan(years=[start.year, end.year, start.year + 1])
+    except Exception:
+        pk_holidays = {}
+
+    by_day = {}
+    for it in items:
+        d = (it.get('start') or '')[:10]
+        if d:
+            by_day.setdefault(d, []).append(it)
+
+    if start == end:
+        header = 'Schedule for ' + start.strftime('%A, %d %b %Y')
+    else:
+        header = 'Schedule for ' + start.strftime('%a %d %b') + ' - ' + end.strftime('%a %d %b %Y')
+
+    lines = [header]
+    empty_days = []
+
+    cur = start
+    while cur <= end:
+        d_str = cur.strftime('%Y-%m-%d')
+        day_events = by_day.get(d_str, [])
+        is_weekend = cur.weekday() >= 5
+        try:
+            holiday_name = pk_holidays.get(cur) if pk_holidays else None
+        except Exception:
+            holiday_name = None
+
+        if day_events:
+            lines.append('')
+            lines.append('**' + cur.strftime('%A, %d %b %Y') + '**')
+            for it in day_events:
+                st = (it.get('start') or '')[11:16]
+                et = (it.get('end') or '')[11:16]
+                title = it.get('title') or '(untitled)'
+                typ = it.get('entry_type') or 'event'
+                if it.get('all_day'):
+                    lines.append('- All day  ' + title + ' (' + typ + ')')
+                else:
+                    lines.append('- ' + st + '-' + et + '  ' + title + ' (' + typ + ')')
+        else:
+            empty_days.append((cur, is_weekend, holiday_name))
+
+        cur = cur + timedelta(days=1)
+
+    if empty_days:
+        lines.append('')
+        lines.append('**Days with no events:**')
+        for d, weekend, hol in empty_days:
+            label = d.strftime('%a, %d %b')
+            reasons = []
+            if hol:
+                reasons.append('holiday: ' + str(hol))
+            elif weekend:
+                reasons.append('weekend (' + d.strftime('%A') + ')')
+            if reasons:
+                lines.append('- ' + label + '  (' + ', '.join(reasons) + ')')
+            else:
+                lines.append('- ' + label + '  (no events)')
+
+    if not items and not empty_days:
+        lines.append('- Nothing scheduled in this range.')
+
+    return '\n'.join(lines)
+class BriefingAgent(BaseAgent):
+    name = 'briefing'
+
+    async def run(self, payload: AgentInput) -> AgentOutput:
+        try:
+            ctx = payload.context or {}
+            tenant_id = ctx.get('tenant_id')
+            if not tenant_id:
+                return AgentOutput(success=False, error='briefing agent requires tenant_id')
+
+            req = (ctx.get('user_request') or payload.task_description or '').lower()
+            today = datetime.now(local_tz()).date()
+            start_date, end_date = _parse_range(req, today)
+
+            if start_date == end_date:
+                data = await build_briefing(str(tenant_id), start_date)
+                return AgentOutput(
+                    success=True,
+                    result={
+                        'action': 'daily_briefing',
+                        'date': start_date.isoformat(),
+                        'range_start': start_date.isoformat(),
+                        'range_end': end_date.isoformat(),
+                        'summary': data['formatted'],
+                        'formatted': data['formatted'],
+                        'items': data['items'],
+                        'pending_approvals': data['pending_approvals'],
+                        'requires_approval': False,
+                    },
+                )
+
+            # Convert date -> timezone-aware datetime for list_occurrences
+            from datetime import time as _time
+            _tz = local_tz()
+            start_dt = datetime.combine(start_date, _time.min, tzinfo=_tz)
+            end_dt = datetime.combine(end_date + timedelta(days=1), _time.min, tzinfo=_tz)
+            items = await list_occurrences(str(tenant_id), start_dt, end_dt)
+            formatted = _format_range(items, start_date, end_date)
+            return AgentOutput(
+                success=True,
+                result={
+                    'action': 'range_briefing',
+                    'date': start_date.isoformat(),
+                    'range_start': start_date.isoformat(),
+                    'range_end': end_date.isoformat(),
+                    'summary': formatted,
+                    'formatted': formatted,
+                    'items': items,
+                    'pending_approvals': [],
+                    'requires_approval': False,
+                },
+            )
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return AgentOutput(success=False, error='briefing failed: ' + str(exc))

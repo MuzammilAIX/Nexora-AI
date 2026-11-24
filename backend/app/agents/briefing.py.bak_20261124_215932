@@ -1,0 +1,47 @@
+"""Briefing agent: read-only. Answers "what's our schedule today?"."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+from .base import BaseAgent, AgentInput, AgentOutput
+from ..tools.briefing import build_briefing
+from ..tools.schedule import local_tz
+
+
+class BriefingAgent(BaseAgent):
+    name = "briefing"
+
+    async def run(self, payload: AgentInput) -> AgentOutput:
+        try:
+            ctx = payload.context or {}
+            tenant_id = ctx.get("tenant_id")
+            if not tenant_id:
+                return AgentOutput(success=False, error="briefing agent requires tenant_id")
+
+            req = (ctx.get("user_request") or payload.task_description or "").lower()
+            today = datetime.now(local_tz()).date()
+            # Typo-tolerant day parsing (tommor / tommorow / tomorow / tomorrow)
+            TOMORROW_FORMS = ("tomorrow", "tommorow", "tommor", "tomorow", "tomorr")
+            YESTERDAY_FORMS = ("yesterday", "yesterdy", "yesterdya")
+            if any(f in req for f in TOMORROW_FORMS):
+                day = today + timedelta(days=1)
+            elif any(f in req for f in YESTERDAY_FORMS):
+                day = today - timedelta(days=1)
+            else:
+                day = today
+
+            data = await build_briefing(str(tenant_id), day)
+            return AgentOutput(
+                success=True,
+                result={
+                    "action": "daily_briefing",
+                    "date": data.get("date"),
+                    "summary": data["formatted"],
+                    "formatted": data["formatted"],
+                    "items": data["items"],
+                    "pending_approvals": data["pending_approvals"],
+                    "requires_approval": False,
+                },
+            )
+        except Exception as exc:
+            return AgentOutput(success=False, error=f"briefing failed: {exc}")
