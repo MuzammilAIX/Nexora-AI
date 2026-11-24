@@ -1,5 +1,6 @@
-from app.agents.calendar import CalendarAgent
+﻿from app.agents.calendar import CalendarAgent
 from app.agents.bulk_email import BulkEmailAgent
+from app.agents.briefing import BriefingAgent
 from typing import Any, Literal
 from typing_extensions import TypedDict
 
@@ -99,6 +100,18 @@ EMAIL_REQUEST_PATTERNS = _re.compile(
     _re.IGNORECASE,
 )
 
+
+
+SEND_INTENT_PATTERNS = _re.compile(
+    r"\b(send|email|e-mail|share|notify|publish|deliver|forward|mail|distribute)\b"
+    r"[^.]*\b(it|this|that|them|the\s+report|the\s+results|to\s+the\s+team|"
+    r"to\s+everyone|to\s+all|to\s+my|to\s+the\s+board|to\s+management)\b",
+    _re.IGNORECASE,
+)
+
+def _is_send_intent(user_request: str) -> bool:
+    """True if the user asks to deliver/publish/share something externally."""
+    return bool(SEND_INTENT_PATTERNS.search(user_request or ""))
 
 def _force_email_agent(user_request: str) -> bool:
     """Deterministic email-intent detector (single-recipient email)."""
@@ -206,6 +219,41 @@ def get_llm() -> ChatOpenAI:
 # 4. Agent Registry
 # --------------------------------------------------
 
+BRIEFING_PATTERNS = _re.compile(
+    r"\b(daily\s+briefing|morning\s+briefing|my\s+briefing|briefing|agenda|"
+    r"today'?s?\s+schedule|schedule\s+(?:for\s+)?today|schedule\s+today|"
+    r"(?:our|my)\s+(?:today'?s?\s+)?schedule|tomorrow'?s?\s+schedule|"
+    r"what'?s\s+(?:on\s+)?(?:for\s+)?today|"
+    r"what'?s?\s+(?:my\s+|the\s+|our\s+)?(?:schedule|calendar|agenda|plan)|"
+    r"(?:my|our|the)\s+(?:schedule|calendar|agenda|plan)\s+(?:for\s+)?(?:today|tomorrow|tommor|tommorow|tomorow|this\s+week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)?|"
+    r"(?:today|tomorrow|tommor|tommorow|tomorow)\s+(?:schedule|calendar|agenda|plan|events?)|"
+    r"(?:today'?s?|tomorrow'?s?|tommor'?s?|tommorow'?s?|tomorow'?s?)\s+(?:schedule|calendar|agenda|plan|events?)|"
+    r"(?:show|see|list)\s+(?:me\s+)?(?:my|the|our)?\s*(?:schedule|calendar|agenda|events|plan)|"
+    r"what\s+(?:do\s+i\s+have|is|are)\s+(?:on\s+)?(?:my\s+)?(?:schedule|calendar|agenda|plan|today|tomorrow|this)|"
+    r"what'?s?\s+(?:happening|going\s+on)|"
+    r"(?:any|my)\s+(?:events?|meetings?|appointments?)\s+(?:today|tomorrow|tommor|this)|"
+    r"what\s+(?:events?|meetings?)\s+(?:do\s+i\s+have|are\s+scheduled)|"
+    r"schedule\s+(?:of\s+|for\s+)?(?:the\s+)?(?:next|this|coming|upcoming)\s+(?:\w+\s+)?(?:days?|weeks?|months?)|"
+    r"(?:next|this|coming|upcoming)\s+(?:\d+\s+)?(?:days?|weeks?|months?)\s+(?:schedule|calendar|agenda|events|plan)|"
+    r"(?:next|this|coming|upcoming)\s+(?:\d+\s+)?(?:days?|weeks?|months?)\b|"
+    r"schedule\s+(?:for|from|until|to|through|till|by|before)\s+|"
+    r"(?:schedule|calendar|agenda|events)\s+(?:until|till|through|to|by|before)\s+|"
+    r"(?:what|show|see|list|tell|give|provide)\s+.*\b(?:schedule|calendar|agenda|events)\b|"
+    r"\b(?:this|next|coming|upcoming)\s+(?:week|month)\b|"
+    r"\b(?:schedule|calendar|agenda)\b.*\b(?:until|till|through|to|by|before|next|this|coming|upcoming)\b|"
+    r"\b\d{1,2}\s+days?\s+(?:schedule|calendar|agenda|plan)\b|"
+    r"\b(?:nxt|nx|upcom\w*)\b.*\b(?:schedule|calendar|agenda)\b|"
+    r"\b(?:schedule|calendar|agenda)\s+(?:for\s+)?\d{1,2}\s+days?\b|"
+    r"\b\d{1,2}\s+days?\s+(?:schedule|calendar|agenda)\b)"
+    ,
+    _re.IGNORECASE,
+)
+
+
+def _is_briefing_request(user_request: str) -> bool:
+    return bool(BRIEFING_PATTERNS.search(user_request or ""))
+
+
 _AGENTS = {
     "research": ResearchAgent(),
     "lead": LeadAgent(),
@@ -217,6 +265,7 @@ _AGENTS = {
     "operations": OperationsAgent(),
     "calendar": CalendarAgent(),
     "bulk_email": BulkEmailAgent(),
+    "briefing": BriefingAgent(),
 }
 
 
@@ -338,11 +387,13 @@ def create_plan(state: OrchestratorState) -> dict:
                 ),
             }]
 
-        # Deterministic override: analytics requests replace the plan with a
-        # single analytics task. Reports auto-prepare (Section 7.3) so
-        # requires_approval=False.
+        # Deterministic override: analytics requests.
+        # - Read-only ("show me the report") -> single analytics task, no approval.
+        # - Read + send ("generate a report and send it") -> analytics + email,
+        #   email gated behind approval.
         if _force_analytics_agent(state.get("user_request", "")):
-            tasks = [{
+            user_req = state.get("user_request", "")
+            analytics_task = {
                 "task_id": "1",
                 "description": (
                     "Retrieve authorized sales data, compute metrics "
@@ -353,7 +404,25 @@ def create_plan(state: OrchestratorState) -> dict:
                 "dependencies": [],
                 "requires_approval": False,
                 "approval_reason": None,
-            }]
+            }
+            if _is_send_intent(user_req):
+                tasks = [
+                    analytics_task,
+                    {
+                        "task_id": "2",
+                        # NOTE: description must NOT contain "draft" - execute_tasks
+                        # auto-approves any task whose description contains "draft".
+                        "description": user_req,
+                        "agent_type": "email",
+                        "dependencies": ["1"],
+                        "requires_approval": True,
+                        "approval_reason": (
+                            "External send: human approval required before delivery."
+                        ),
+                    },
+                ]
+            else:
+                tasks = [analytics_task]
 
         # Deterministic override: operations requests. The agent
         # decides whether approval is needed based on order total.
@@ -381,6 +450,15 @@ def create_plan(state: OrchestratorState) -> dict:
             tasks[0]["approval_reason"] = (
                 "Email send: human approval required before delivery."
             )
+
+        # Deterministic override: schedule/briefing questions go to the read-only briefing agent.
+        if _is_briefing_request(state.get("user_request", "")) and tasks:
+            del tasks[1:]
+            tasks[0]["agent_type"] = "briefing"
+            tasks[0]["description"] = (
+                "Compile the daily schedule briefing for: " + state.get("user_request", "")
+            )
+            tasks[0]["requires_approval"] = False
 
         # Deterministic override: bulk email requests route to bulk_email.
         # Rationale: the LLM misclassifies "send to all users" as operations/email.
@@ -465,7 +543,7 @@ async def execute_tasks(state: OrchestratorState) -> dict:
         # to compute the actual proposed action, then decide:
         #   - if the agent says requires_approval=True -> create approval
         #   - otherwise -> execute immediately
-        if agent_type in ("operations", "support", "calendar") and not draft_only:
+        if agent_type in ("operations", "support", "calendar", "analytics") and not draft_only:
             prep_agent = _AGENTS.get(agent_type)
             if prep_agent is not None:
                 dep_results = {
